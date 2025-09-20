@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: coactivation-manifolds
+Version: 0.1.0
+Summary: Coactivation manifold experiments
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.2
+Requires-Dist: transformers>=4.39
+Requires-Dist: accelerate>=0.27
+Requires-Dist: safetensors>=0.4
+Requires-Dist: numpy>=1.26
+Requires-Dist: pyarrow>=15.0
+Requires-Dist: datasets>=2.18
+Requires-Dist: tqdm>=4.66
+Requires-Dist: scikit-learn>=1.4
+Requires-Dist: sae-lens>=0.3.0
+Requires-Dist: pytest>=8.4.2
+Requires-Dist: python-dotenv>=1.0

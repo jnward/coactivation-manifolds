@@ -1,0 +1,12 @@
+pyproject.toml
+src/coactivation_manifolds/__init__.py
+src/coactivation_manifolds/activation_pipeline.py
+src/coactivation_manifolds/activation_reader.py
+src/coactivation_manifolds/activation_writer.py
+src/coactivation_manifolds/sae_loader.py
+src/coactivation_manifolds.egg-info/PKG-INFO
+src/coactivation_manifolds.egg-info/SOURCES.txt
+src/coactivation_manifolds.egg-info/dependency_links.txt
+src/coactivation_manifolds.egg-info/requires.txt
+src/coactivation_manifolds.egg-info/top_level.txt
+tests/test_activation_io.py

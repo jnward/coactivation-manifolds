@@ -1,0 +1,23 @@
+[project]
+name = "coactivation-manifolds"
+version = "0.1.0"
+description = "Coactivation manifold experiments"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",
+  "transformers>=4.39",
+  "accelerate>=0.27",
+  "safetensors>=0.4",
+  "numpy>=1.26",
+  "pyarrow>=15.0",
+  "datasets>=2.18",
+  "tqdm>=4.66",
+  "scikit-learn>=1.4",
+  "sae-lens>=0.3.0",
+  "pytest>=8.4.2",
+  "python-dotenv>=1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
