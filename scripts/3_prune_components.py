@@ -4,44 +4,17 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Tuple
+import sys
 
-import numpy as np
-import pyarrow.parquet as pq
+ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-from coactivation_manifolds.sae_loader import (
-    DEFAULT_SAE_NAME,
-    DEFAULT_SAE_RELEASE,
-    load_sae,
+from coactivation_manifolds.component_graph import (
+    ComponentGraphConfig,
+    compute_components,
 )
-
-
-class UnionFind:
-    def __init__(self, size: int) -> None:
-        self.parent = np.arange(size, dtype=np.int32)
-        self.rank = np.zeros(size, dtype=np.int8)
-
-    def find(self, x: int) -> int:
-        parent = self.parent
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(self, a: int, b: int) -> None:
-        ra = self.find(a)
-        rb = self.find(b)
-        if ra == rb:
-            return
-        rank = self.rank
-        parent = self.parent
-        if rank[ra] < rank[rb]:
-            parent[ra] = rb
-        elif rank[ra] > rank[rb]:
-            parent[rb] = ra
-        else:
-            parent[rb] = ra
-            rank[ra] += 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,16 +45,16 @@ def parse_args() -> argparse.Namespace:
         "--decoder-path",
         type=Path,
         default=None,
-        help="Decoder matrix (.npy/.npz). When omitted, the SAE is loaded and cached to metadata/decoder_directions.npy",
+        help="Decoder matrix (.npy/.npz). When omitted, cached under metadata/decoder_directions.npy",
     )
     parser.add_argument(
         "--sae-release",
-        default=DEFAULT_SAE_RELEASE,
-        help="sae-lens release identifier (used when generating decoder directions)",
+        default=None,
+        help="sae-lens release identifier (defaults to 0_generate_activations default)",
     )
     parser.add_argument(
         "--sae-name",
-        default=DEFAULT_SAE_NAME,
+        default=None,
         help="sae-lens SAE identifier within the release",
     )
     parser.add_argument(
@@ -181,109 +154,37 @@ def _resolve_decoder_vectors(
 def main() -> None:
     args = parse_args()
 
-    counts_table = pq.read_table(args.feature_counts_path, columns=["feature_id", "count"])
-    metadata = counts_table.schema.metadata or {}
-    token_count_raw = metadata.get(b"token_count")
-    if token_count_raw is None:
-        raise ValueError(
-            "feature_counts_trimmed.parquet missing token_count metadata; rerun 1_compute_coactivations.py"
-        )
-    token_count = int(token_count_raw.decode())
-    feature_ids = counts_table.column("feature_id").to_numpy(zero_copy_only=False)
-    counts = counts_table.column("count").to_numpy(zero_copy_only=False)
+    config = ComponentGraphConfig(
+        coactivations_path=args.coactivations_path,
+        feature_counts_path=args.feature_counts_path,
+        jaccard_threshold=args.jaccard_threshold,
+        cosine_threshold=args.cosine_threshold,
+        decoder_path=args.decoder_path,
+        sae_release=args.sae_release or ComponentGraphConfig.__dataclass_fields__["sae_release"].default,
+        sae_name=args.sae_name or ComponentGraphConfig.__dataclass_fields__["sae_name"].default,
+        device=args.device,
+        density_threshold=args.density_threshold,
+        batch_size=args.batch_size,
+    )
 
-    if len(feature_ids) == 0:
-        print("No features found in counts table")
-        return
+    result = compute_components(config)
 
-    max_feature_id = int(feature_ids.max())
-    uf = UnionFind(max_feature_id + 1)
-
-    active_mask = np.zeros(max_feature_id + 1, dtype=bool)
-    density_threshold = args.density_threshold
-    removed_for_density = 0
-    for fid, count in zip(feature_ids, counts):
-        idx = int(fid)
-        if count > 0:
-            if idx >= active_mask.size:
-                continue
-            if density_threshold is not None and token_count > 0:
-                density = float(count) / float(token_count)
-                if density > density_threshold:
-                    removed_for_density += 1
-                    continue
-            active_mask[idx] = True
-    active_indices = np.nonzero(active_mask)[0]
-    active_features = set(int(i) for i in active_indices)
-
-    cosine_threshold = args.cosine_threshold
-    vectors = None
-    norms = None
-    if cosine_threshold is not None:
-        metadata_dir = args.feature_counts_path.resolve().parent
-        vectors, _ = _resolve_decoder_vectors(
-            feature_count=max_feature_id + 1,
-            decoder_path=args.decoder_path,
-            metadata_dir=metadata_dir,
-            sae_release=args.sae_release,
-            sae_name=args.sae_name,
-            device=args.device,
-        )
-        norms = np.linalg.norm(vectors, axis=1)
-        if np.any(norms == 0):
-            raise ValueError("Decoder weights contain zero-norm feature vectors")
-
-    edges_kept = 0
-    pf = pq.ParquetFile(args.coactivations_path)
-    for batch in pf.iter_batches(columns=["feature_i", "feature_j", "jaccard"], batch_size=args.batch_size):
-        jacc = batch.column("jaccard").to_numpy(zero_copy_only=False)
-        mask = jacc >= args.jaccard_threshold
-        if not mask.any():
-            continue
-        fi = batch.column("feature_i").to_numpy(zero_copy_only=False)[mask].astype(np.int32, copy=False)
-        fj = batch.column("feature_j").to_numpy(zero_copy_only=False)[mask].astype(np.int32, copy=False)
-        for a, b in zip(fi, fj):
-            if a >= active_mask.size or b >= active_mask.size:
-                continue
-            if not active_mask[a] or not active_mask[b]:
-                continue
-            if cosine_threshold is not None and vectors is not None and norms is not None:
-                denom = norms[a] * norms[b]
-                if denom == 0:
-                    continue
-                cos = float(np.dot(vectors[a], vectors[b]) / denom)
-                if cos > cosine_threshold:
-                    continue
-            uf.union(int(a), int(b))
-            edges_kept += 1
-
-    if not active_features:
-        print("No active features after trimming")
-        return
-
-    component_sizes = {}
-    for fid in active_features:
-        root = uf.find(fid)
-        component_sizes[root] = component_sizes.get(root, 0) + 1
-
-    singleton_components = sum(1 for size in component_sizes.values() if size == 1)
-    multi_sizes = [size for size in component_sizes.values() if size > 1]
+    components = [c for c in result.components if len(c) > 1]
     thresholds = [2, 3, 5, 10]
-    counts_by_threshold = {t: sum(1 for size in multi_sizes if size > t) for t in thresholds}
-    num_components = len(multi_sizes)
-    largest = max(multi_sizes) if multi_sizes else 0
-    features_in_multis = int(sum(multi_sizes))
+    counts_by_threshold = {t: sum(1 for comp in components if len(comp) > t) for t in thresholds}
+    largest = max((len(comp) for comp in components), default=0)
+    features_in_multis = sum(len(comp) for comp in components)
 
     print(f"Jaccard threshold: {args.jaccard_threshold}")
-    if cosine_threshold is not None:
-        print(f"Cosine threshold: {cosine_threshold}")
-    if density_threshold is not None:
-        print(f"Density threshold: {density_threshold}")
-        print(f"Features removed for density: {removed_for_density}")
-    print(f"Active features: {len(active_features)}")
-    print(f"Edges kept: {edges_kept}")
-    print(f"Singleton components: {singleton_components}")
-    print(f"Components (size>1): {num_components}")
+    if args.cosine_threshold is not None:
+        print(f"Cosine threshold: {args.cosine_threshold}")
+    if args.density_threshold is not None:
+        print(f"Density threshold: {args.density_threshold}")
+        print(f"Features removed for density: {result.removed_for_density}")
+    print(f"Active features: {len(result.active_features)}")
+    print(f"Edges kept: {result.edges_kept}")
+    print(f"Singleton components: {result.singleton_components}")
+    print(f"Components (size>1): {len(components)}")
     for t in thresholds:
         print(f"Components (size>{t}): {counts_by_threshold[t]}")
     print(f"Largest component size: {largest}")

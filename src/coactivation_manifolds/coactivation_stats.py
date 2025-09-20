@@ -10,6 +10,7 @@ from typing import Dict, Iterable, Tuple
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tqdm import tqdm
 
 
 @dataclass
@@ -44,7 +45,7 @@ def compute_coactivation_counts(
     pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
 
     shard_paths = sorted(activations_dir.glob("shard=*"), key=lambda p: p.name)
-    for shard_path in shard_paths:
+    for shard_path in tqdm(shard_paths, desc="Shards", leave=False):
         file_path = shard_path / "data.parquet"
         table = pq.read_table(file_path, columns=["position_in_doc", "feature_ids"])
         positions: Iterable[int] = table.column("position_in_doc").to_pylist()
