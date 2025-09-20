@@ -10,3 +10,5 @@ scikit-learn>=1.4
 sae-lens>=0.3.0
 pytest>=8.4.2
 python-dotenv>=1.0
+zstandard>=0.25.0
+matplotlib>=3.9

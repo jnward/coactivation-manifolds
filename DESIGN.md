@@ -125,7 +125,7 @@ For clusters with interesting geometry, check:
 - `coactivation_manifolds/activation_pipeline.py`: Gemma+SAE runner that feeds the writer from a Hugging Face dataset.
 - `coactivation_manifolds/activation_reader.py`: feature index builder plus cluster-oriented slice loader.
 - `coactivation_manifolds/sae_loader.py`: sae-lens helper that fetches the GemmaScope SAE and exposes metadata like feature count.
-- `scripts/run_logging.py`: CLI that ties everything together (model/tokenizer/SAE/dataset → shards + feature index).
+- `scripts/0_generate_activations.py`: CLI that ties everything together (model/tokenizer/SAE/dataset → shards + feature index).
 
 ## Expected Outcomes
 

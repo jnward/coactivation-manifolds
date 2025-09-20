@@ -33,6 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=1024, help="Tokenizer max length")
     parser.add_argument("--max-tokens", type=int, default=None, help="Stop after logging this many tokens")
     parser.add_argument("--shard-size", type=int, default=8192, help="Tokens per Parquet shard")
+    parser.add_argument(
+        "--stream-dataset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream the dataset instead of downloading locally (default: True)",
+    )
     parser.add_argument("--device", default="cuda", help="Device for model/SAE (e.g., cuda, cuda:1, cpu)")
     parser.add_argument("--layer-index", type=int, default=12, help="Model layer to tap for activations")
     parser.add_argument("--model-name", default="google/gemma-2-2b", help="Hugging Face model id")
@@ -64,7 +70,12 @@ def main() -> None:
         device=args.device,
     )
 
-    dataset = load_dataset(args.dataset, args.dataset_config, split=args.split)
+    dataset = load_dataset(
+        args.dataset,
+        args.dataset_config,
+        split=args.split,
+        streaming=args.stream_dataset,
+    )
 
     feature_count = handle.feature_count
     writer = ActivationWriter(activations_dir, num_features=feature_count, shard_size_tokens=args.shard_size)
