@@ -7,7 +7,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +40,7 @@ class PCAResult:
     count_hist: List[int]
     pca_components: np.ndarray
     pca_mean: np.ndarray
+    snippets: List[str]
 
     @property
     def feature_count(self) -> int:
@@ -149,9 +150,9 @@ def collect_component_matrices(
     *,
     ignore_prefix: int,
     show_progress: bool,
-) -> List[np.ndarray]:
+) -> tuple[List[np.ndarray], List[List[str]]]:
     if not components:
-        return []
+        return [], []
 
     activations_dir = run_dir / "activations"
     mapping: dict[int, tuple[int, int]] = {}
@@ -162,6 +163,7 @@ def collect_component_matrices(
             mapping[int(fid)] = (comp_idx, local_idx)
 
     records: List[List[np.ndarray]] = [[] for _ in components]
+    snippet_storage: List[List[str]] = [[] for _ in components]
 
     shard_paths = sorted(activations_dir.glob("shard=*"), key=lambda p: p.name)
     shard_iter = shard_paths
@@ -171,11 +173,27 @@ def collect_component_matrices(
     for shard_path in shard_iter:
         file_path = shard_path / "data.parquet"
         pf = pq.ParquetFile(file_path)
-        for batch in pf.iter_batches(columns=["position_in_doc", "feature_ids", "activations"]):
+        sidecar_path = shard_path / "token_text.parquet"
+        shard_snippets: Optional[List[str]] = None
+        sidecar_offset = 0
+        has_inline_snippets = "token_text" in pf.schema.names
+        if not has_inline_snippets and sidecar_path.exists():
+            shard_snippets = pq.read_table(sidecar_path, columns=["token_text"]).column(0).to_pylist()
+        columns = ["position_in_doc", "feature_ids", "activations"]
+        if has_inline_snippets:
+            columns.append("token_text")
+        for batch in pf.iter_batches(columns=columns):
             positions = batch.column("position_in_doc").to_numpy(zero_copy_only=False)
             feat_lists = batch.column("feature_ids").to_pylist()
             act_lists = batch.column("activations").to_pylist()
-            for pos, feats, acts in zip(positions, feat_lists, act_lists):
+            if has_inline_snippets:
+                text_list = batch.column("token_text").to_pylist()
+            elif shard_snippets is not None:
+                text_list = shard_snippets[sidecar_offset : sidecar_offset + len(positions)]
+                sidecar_offset += len(positions)
+            else:
+                text_list = [""] * len(positions)
+            for pos, feats, acts, snippet_text in zip(positions, feat_lists, act_lists, text_list):
                 if pos < ignore_prefix:
                     continue
                 comp_hits: dict[int, np.ndarray] = {}
@@ -192,19 +210,24 @@ def collect_component_matrices(
                 for comp_idx, vec in comp_hits.items():
                     if np.any(vec):
                         records[comp_idx].append(vec)
+                        snippet_storage[comp_idx].append(snippet_text)
 
     matrices: List[np.ndarray] = []
+    snippets: List[List[str]] = []
     for comp_idx, rows in enumerate(records):
         if rows:
             matrices.append(np.vstack(rows))
+            snippets.append(snippet_storage[comp_idx])
         else:
             matrices.append(np.empty((0, comp_lengths[comp_idx]), dtype=np.float32))
-    return matrices
+            snippets.append([])
+    return matrices, snippets
 
 
 def generate_pca_results(
     components: List[List[int]],
     matrices: List[np.ndarray],
+    snippets: List[List[str]],
     *,
     min_activations: int,
     show_progress: bool,
@@ -217,6 +240,7 @@ def generate_pca_results(
     for idx in indices:
         comp = components[idx]
         matrix = matrices[idx]
+        texts = snippets[idx] if idx < len(snippets) else []
         if matrix.shape[1] < 3:
             continue
         if matrix.shape[0] < max(min_activations, 3):
@@ -235,6 +259,10 @@ def generate_pca_results(
         two = int(hist[2]) if hist.size > 2 else 0
         three_plus = int(hist[3:].sum()) if hist.size > 3 else 0
         count_hist = [one, two, three_plus]
+        if len(texts) < pcs.shape[0]:
+            texts = texts + [""] * (pcs.shape[0] - len(texts))
+        else:
+            texts = texts[: pcs.shape[0]]
         results.append(
             PCAResult(
                 component_index=idx,
@@ -246,6 +274,7 @@ def generate_pca_results(
                 count_hist=count_hist,
                 pca_components=pca.components_.copy(),
                 pca_mean=pca.mean_.copy(),
+                snippets=texts,
             )
         )
     return results
@@ -253,7 +282,11 @@ def generate_pca_results(
 
 def _make_figure_spec(entry: PCAResult) -> dict:
     counts = entry.activation_counts.astype(int)
-    customdata = counts.tolist()
+    snippets = entry.snippets if entry.snippets else []
+    customdata = [
+        [int(counts[i]), snippets[i] if i < len(snippets) else ""]
+        for i in range(len(counts))
+    ]
     colors = []
     for raw_count in counts:
         count = int(raw_count)
@@ -269,7 +302,8 @@ def _make_figure_spec(entry: PCAResult) -> dict:
         f"Comp {entry.component_index}<br>"
         "PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<br>"
         f"Features: {', '.join(str(fid) for fid in entry.feature_ids[:3])}" "<br>"
-        "Active features: %{customdata}<extra></extra>"
+        "Active features: %{customdata[0]}<br>"
+        "Text: %{customdata[1]}<extra></extra>"
     )
     trace = go.Scatter3d(
         x=entry.pcs[:, 0],
@@ -614,7 +648,7 @@ def main() -> None:
             print("No components with the requested feature count were found")
         return
 
-    matrices = collect_component_matrices(
+    matrices, snippet_lists = collect_component_matrices(
         run_dir,
         components,
         ignore_prefix=args.ignore_prefix,
@@ -624,6 +658,7 @@ def main() -> None:
     results = generate_pca_results(
         components,
         matrices,
+        snippet_lists,
         min_activations=args.min_activations,
         show_progress=not args.no_progress,
     )

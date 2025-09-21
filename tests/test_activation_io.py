@@ -22,6 +22,7 @@ def make_record(token_index: int) -> ActivationRecord:
         position_in_doc=token_index,
         feature_ids=[token_index % 5, (token_index + 1) % 5],
         activations=[0.5, 0.2],
+        token_text=f"token-{token_index}",
     )
 
 

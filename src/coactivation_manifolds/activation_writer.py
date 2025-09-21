@@ -21,6 +21,7 @@ TOKEN_SCHEMA = pa.schema(
         ("position_in_doc", pa.int32()),
         ("feature_ids", pa.list_(pa.uint16())),
         ("activations", pa.list_(pa.float16())),
+        ("token_text", pa.large_string()),
     ]
 )
 
@@ -34,6 +35,7 @@ class ActivationRecord:
     position_in_doc: int
     feature_ids: Sequence[int]
     activations: Sequence[float]
+    token_text: str
 
     def validate(self) -> None:
         if len(self.feature_ids) != len(self.activations):
@@ -156,6 +158,7 @@ class ActivationWriter:
         pos_in_doc = [int(r.position_in_doc) for r in records]
         feature_ids = [np.asarray(r.feature_ids, dtype=np.uint16).tolist() for r in records]
         activations = [np.asarray(r.activations, dtype=np.float16).tolist() for r in records]
+        token_text = [r.token_text for r in records]
 
         arrays = {
             "doc_id": pa.array(doc_id, type=pa.int64()),
@@ -163,6 +166,7 @@ class ActivationWriter:
             "position_in_doc": pa.array(pos_in_doc, type=pa.int32()),
             "feature_ids": pa.array(feature_ids, type=pa.list_(pa.uint16())),
             "activations": pa.array(activations, type=pa.list_(pa.float16())),
+            "token_text": pa.array(token_text, type=pa.large_string()),
         }
         return pa.Table.from_pydict(arrays, schema=TOKEN_SCHEMA)
 

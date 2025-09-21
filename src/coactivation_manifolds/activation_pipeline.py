@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, List, Optional
 
+import numpy as np
 import torch
 from datasets import Dataset
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -172,12 +173,15 @@ class ActivationPipeline:
                     feature_ids = nz_np.tolist()
                     activations = feature_vector[nz].numpy().astype("float16").tolist()
 
+                snippet = self._make_snippet(seq_ids.numpy(), token_pos)
+
                 record = ActivationRecord(
                     doc_id=doc_id,
                     token_index=self._global_token_index,
                     position_in_doc=position_in_doc,
                     feature_ids=feature_ids,
                     activations=activations,
+                    token_text=snippet,
                 )
                 records.append(record)
 
@@ -207,3 +211,21 @@ class ActivationPipeline:
                 return getattr(torch, cfg_dtype)
 
         return torch.float32
+
+    def _make_snippet(self, seq_ids: np.ndarray, token_pos: int, window: int = 10) -> str:
+        seq_len = int(seq_ids.shape[0])
+        left_start = max(token_pos - window, 0)
+        right_end = min(token_pos + window + 1, seq_len)
+
+        left_ids = seq_ids[left_start:token_pos]
+        center_ids = seq_ids[token_pos : token_pos + 1]
+        right_ids = seq_ids[token_pos + 1 : right_end]
+
+        decode = self.tokenizer.decode
+        left_text = decode(left_ids.tolist(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        center_text = decode(center_ids.tolist(), skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        right_text = decode(right_ids.tolist(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+        snippet = f"{left_text} «{center_text}» {right_text}".strip()
+        snippet = " ".join(snippet.split())
+        return snippet
