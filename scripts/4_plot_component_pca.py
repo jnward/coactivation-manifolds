@@ -71,10 +71,16 @@ def parse_args() -> argparse.Namespace:
         help="Batch size for streaming coactivations (default: 1e6)",
     )
     parser.add_argument(
-        "--ignore-prefix",
+        "--first-token-idx",
         type=int,
-        default=100,
-        help="Skip tokens with position_in_doc < this value (default: 100)",
+        default=None,
+        help="Inclusive token position to start reading activations (default: metadata value)",
+    )
+    parser.add_argument(
+        "--last-token-idx",
+        type=int,
+        default=None,
+        help="Exclusive token position to stop reading activations (default: metadata value)",
     )
     parser.add_argument(
         "--min-size",
@@ -124,7 +130,8 @@ def collect_component_matrices(
     run_dir: Path,
     components: List[List[int]],
     *,
-    ignore_prefix: int,
+    first_token_idx: int,
+    last_token_idx: int | None,
     show_progress: bool,
 ) -> List[np.ndarray]:
     if not components:
@@ -145,6 +152,8 @@ def collect_component_matrices(
     if show_progress:
         shard_iter = tqdm(shard_paths, desc="Shards", leave=False)
 
+    lower_bound = max(0, first_token_idx)
+
     for shard_path in shard_iter:
         file_path = shard_path / "data.parquet"
         pf = pq.ParquetFile(file_path)
@@ -153,7 +162,9 @@ def collect_component_matrices(
             feat_lists = batch.column("feature_ids").to_pylist()
             act_lists = batch.column("activations").to_pylist()
             for pos, feats, acts in zip(positions, feat_lists, act_lists):
-                if pos < ignore_prefix:
+                if pos < lower_bound:
+                    continue
+                if last_token_idx is not None and last_token_idx >= 0 and pos >= last_token_idx:
                     continue
                 comp_hits: Dict[int, np.ndarray] = {}
                 for fid, act in zip(feats, acts):
@@ -292,10 +303,16 @@ def main() -> None:
         print("No components of size >1 found under the given thresholds")
         return
 
+    metadata_first = result.first_token_idx
+    metadata_last = result.last_token_idx if result.last_token_idx >= 0 else None
+    resolved_first = args.first_token_idx if args.first_token_idx is not None else metadata_first
+    resolved_last = args.last_token_idx if args.last_token_idx is not None else metadata_last
+
     matrices = collect_component_matrices(
         run_dir,
         components,
-        ignore_prefix=args.ignore_prefix,
+        first_token_idx=resolved_first,
+        last_token_idx=resolved_last,
         show_progress=not args.no_progress,
     )
 

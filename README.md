@@ -26,12 +26,20 @@ Accumulates per-feature totals and pairwise Jaccard stats with a shard progress 
 
 ```bash
 PYTHONPATH=src python scripts/1_compute_coactivations.py data/test_acts \
-  --ignore-prefix 100 \
+  --first-token-idx 100 \
   --output-name coactivations.parquet \
   --feature-counts-name feature_counts_trimmed.parquet
 ```
 
 Outputs live in `data/test_acts/metadata/`.
+
+Defaults process token positions `[0, 1024)`. Adjust `--first-token-idx` and
+`--last-token-idx` to clamp the per-document window (e.g., `1` and `10`
+capture the nine tokens immediately after BOS).
+
+The PCA utilities (`4_plot_component_pca.py`, `visualize_3D_component_plots.py`)
+inherit the same bounds from the trimmed feature counts by default; override
+with their `--first-token-idx` / `--last-token-idx` flags when experimenting.
 
 ## 2. Plot Jaccard Percentiles
 Visualises the tail of the Jaccard distribution on a log–log scale.
@@ -72,3 +80,25 @@ PYTHONPATH=src python scripts/4_plot_component_pca.py data/test_acts \
 ```
 
 Look for `component_pca_plots/component_pca_000.png`, etc., to review clusters quickly. Use `--no-progress` on any script to silence tqdm bars when desired.
+
+## 5. Probability Simplex Experiments
+Given a feature list, extract co-firing snippets, score definition choices with
+Gemma-2-2b-it, and visualize the probability simplex in feature space.
+
+```bash
+# (optional) ensure token_text snippets exist on the run
+PYTHONPATH=src python scripts/add_token_snippets.py data/test_acts
+
+# 1) collect snippets where all features fire together
+PYTHONPATH=src python -m coactivation_manifolds.visualize_probability_simplex.collect_joint_snippets \
+  data/test_acts --features 12345 23456 34567 --max-examples 200
+
+# 2) score the snippets against multiple-choice definitions
+PYTHONPATH=src python -m coactivation_manifolds.visualize_probability_simplex.score_definitions \
+  data/test_acts/metadata/probability_simplex/snippets_12345_23456_34567.parquet \
+  --choice A="definition text for A" --choice B="definition text for B" --choice C="definition text for C"
+
+# 3) project activations onto their top PCs and color by definition probabilities
+PYTHONPATH=src python -m coactivation_manifolds.visualize_probability_simplex.plot_probability_simplex \
+  data/test_acts/metadata/probability_simplex/snippets_12345_23456_34567_scored.parquet
+```

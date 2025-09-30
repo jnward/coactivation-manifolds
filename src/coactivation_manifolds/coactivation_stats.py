@@ -20,12 +20,15 @@ class CoactivationCounts:
     feature_counts: np.ndarray
     pair_counts: Dict[Tuple[int, int], int]
     token_count: int
+    first_token_idx: int
+    last_token_idx: int
 
 
 def compute_coactivation_counts(
     run_dir: Path | str,
     *,
-    ignore_prefix_tokens: int = 100,
+    first_token_idx: int = 0,
+    last_token_idx: int = 1024,
 ) -> CoactivationCounts:
     """Accumulate feature counts and pairwise intersections from activation shards."""
 
@@ -45,6 +48,11 @@ def compute_coactivation_counts(
     pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
 
     shard_paths = sorted(activations_dir.glob("shard=*"), key=lambda p: p.name)
+    if first_token_idx < 0:
+        raise ValueError("first_token_idx must be non-negative")
+    if last_token_idx <= first_token_idx:
+        raise ValueError("last_token_idx must be greater than first_token_idx")
+
     for shard_path in tqdm(shard_paths, desc="Shards", leave=False):
         file_path = shard_path / "data.parquet"
         table = pq.read_table(file_path, columns=["position_in_doc", "feature_ids"])
@@ -52,7 +60,7 @@ def compute_coactivation_counts(
         feature_lists: Iterable[Iterable[int]] = table.column("feature_ids").to_pylist()
 
         for position, features in zip(positions, feature_lists):
-            if position < ignore_prefix_tokens:
+            if position < first_token_idx or position >= last_token_idx:
                 continue
             token_count += 1
             feats = [int(f) for f in features]
@@ -71,6 +79,8 @@ def compute_coactivation_counts(
         feature_counts=feature_counts,
         pair_counts=dict(pair_counts),
         token_count=token_count,
+        first_token_idx=first_token_idx,
+        last_token_idx=last_token_idx,
     )
 
 
@@ -139,6 +149,8 @@ def write_feature_totals(
     feature_counts: np.ndarray,
     *,
     token_count: int,
+    first_token_idx: int,
+    last_token_idx: int,
     output_path: Path | str,
 ) -> None:
     """Persist per-feature activation totals to Parquet."""
@@ -151,6 +163,10 @@ def write_feature_totals(
             "count": pa.array(feature_counts, type=pa.int64()),
         }
     )
-    metadata = {b"token_count": str(int(token_count)).encode()}
+    metadata = {
+        b"token_count": str(int(token_count)).encode(),
+        b"first_token_idx": str(int(first_token_idx)).encode(),
+        b"last_token_idx": str(int(last_token_idx)).encode(),
+    }
     table = table.replace_schema_metadata(metadata)
     pq.write_table(table, path, compression="zstd")

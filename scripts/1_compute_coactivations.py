@@ -16,10 +16,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute Jaccard-ready coactivation counts")
     parser.add_argument("run_dir", type=Path, help="Directory containing activations/ and metadata/")
     parser.add_argument(
-        "--ignore-prefix",
+        "--first-token-idx",
         type=int,
-        default=100,
-        help="Tokens to skip at the start of each document (default: 100)",
+        default=0,
+        help="Inclusive starting token index per document (default: 0)",
+    )
+    parser.add_argument(
+        "--last-token-idx",
+        type=int,
+        default=1024,
+        help="Exclusive ending token index per document (default: 1024)",
     )
     parser.add_argument(
         "--output-name",
@@ -29,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--feature-counts-name",
         default="feature_counts_trimmed.parquet",
-        help="Filename for per-feature totals after prefix skipping",
+        help="Filename for per-feature totals after token window filtering",
     )
     return parser.parse_args()
 
@@ -37,13 +43,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     run_dir = args.run_dir
-    counts = compute_coactivation_counts(run_dir, ignore_prefix_tokens=args.ignore_prefix)
+    counts = compute_coactivation_counts(
+        run_dir,
+        first_token_idx=args.first_token_idx,
+        last_token_idx=args.last_token_idx,
+    )
 
     metadata_dir = run_dir / "metadata"
     write_coactivation_table(counts, output_path=metadata_dir / args.output_name)
     write_feature_totals(
         counts.feature_counts,
         token_count=counts.token_count,
+        first_token_idx=counts.first_token_idx,
+        last_token_idx=counts.last_token_idx,
         output_path=metadata_dir / args.feature_counts_name,
     )
 

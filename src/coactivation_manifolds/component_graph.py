@@ -32,6 +32,8 @@ class ComponentGraphResult:
     active_features: set[int]
     feature_counts: np.ndarray
     token_count: int
+    first_token_idx: int
+    last_token_idx: int
     edges_kept: int
     singleton_components: int
     removed_for_density: int
@@ -155,6 +157,8 @@ def compute_components(config: ComponentGraphConfig) -> ComponentGraphResult:
             "feature_counts_trimmed.parquet missing token_count metadata; rerun 1_compute_coactivations.py"
         )
     token_count = int(token_count_raw.decode())
+    first_token_idx = int(metadata.get(b"first_token_idx", b"0").decode())
+    last_token_idx = int(metadata.get(b"last_token_idx", b"-1").decode())
 
     feature_ids = counts_table.column("feature_id").to_numpy(zero_copy_only=False)
     counts = counts_table.column("count").to_numpy(zero_copy_only=False)
@@ -165,6 +169,8 @@ def compute_components(config: ComponentGraphConfig) -> ComponentGraphResult:
             active_features=set(),
             feature_counts=counts,
             token_count=token_count,
+            first_token_idx=first_token_idx,
+            last_token_idx=last_token_idx,
             edges_kept=0,
             singleton_components=0,
             removed_for_density=0,
@@ -245,6 +251,8 @@ def compute_components(config: ComponentGraphConfig) -> ComponentGraphResult:
         active_features=active_features,
         feature_counts=counts,
         token_count=token_count,
+        first_token_idx=first_token_idx,
+        last_token_idx=last_token_idx,
         edges_kept=edges_kept,
         singleton_components=singleton_components,
         removed_for_density=removed_for_density,
