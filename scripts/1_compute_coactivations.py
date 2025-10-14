@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         default="feature_counts_trimmed.parquet",
         help="Filename for per-feature totals after token window filtering",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for shard processing (default: 1)",
+    )
     return parser.parse_args()
 
 
@@ -47,6 +53,7 @@ def main() -> None:
         run_dir,
         first_token_idx=args.first_token_idx,
         last_token_idx=args.last_token_idx,
+        num_workers=args.num_workers,
     )
 
     metadata_dir = run_dir / "metadata"

@@ -4,8 +4,9 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import combinations
+from multiprocessing import Pool
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -24,36 +25,21 @@ class CoactivationCounts:
     last_token_idx: int
 
 
-def compute_coactivation_counts(
-    run_dir: Path | str,
-    *,
-    first_token_idx: int = 0,
-    last_token_idx: int = 1024,
-) -> CoactivationCounts:
-    """Accumulate feature counts and pairwise intersections from activation shards."""
+def _process_shard_batch(
+    shard_paths: List[Path],
+    num_features: int,
+    first_token_idx: int,
+    last_token_idx: int,
+) -> Tuple[np.ndarray, Dict[Tuple[int, int], int], int]:
+    """Process a batch of shards and return partial counts.
 
-    run_path = Path(run_dir)
-    activations_dir = run_path / "activations"
-    metadata_dir = run_path / "metadata"
-
-    feature_counts_path = metadata_dir / "feature_counts.parquet"
-    if not feature_counts_path.exists():
-        raise FileNotFoundError(f"Missing feature counts at {feature_counts_path}")
-
-    counts_table = pq.read_table(feature_counts_path, columns=["count"])
-    num_features = counts_table.num_rows
+    Used by multiprocessing workers.
+    """
     feature_counts = np.zeros(num_features, dtype=np.int64)
+    pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
     token_count = 0
 
-    pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
-
-    shard_paths = sorted(activations_dir.glob("shard=*"), key=lambda p: p.name)
-    if first_token_idx < 0:
-        raise ValueError("first_token_idx must be non-negative")
-    if last_token_idx <= first_token_idx:
-        raise ValueError("last_token_idx must be greater than first_token_idx")
-
-    for shard_path in tqdm(shard_paths, desc="Shards", leave=False):
+    for shard_path in shard_paths:
         file_path = shard_path / "data.parquet"
         table = pq.read_table(file_path, columns=["position_in_doc", "feature_ids"])
         positions: Iterable[int] = table.column("position_in_doc").to_pylist()
@@ -75,9 +61,118 @@ def compute_coactivation_counts(
                     a, b = b, a
                 pair_counts[(a, b)] += 1
 
+    return feature_counts, dict(pair_counts), token_count
+
+
+def _merge_results(
+    results: List[Tuple[np.ndarray, Dict[Tuple[int, int], int], int]]
+) -> Tuple[np.ndarray, Dict[Tuple[int, int], int], int]:
+    """Merge results from multiple workers."""
+    if not results:
+        raise ValueError("No results to merge")
+
+    # Merge feature counts (simple addition)
+    merged_feature_counts = results[0][0].copy()
+    for feature_counts, _, _ in results[1:]:
+        merged_feature_counts += feature_counts
+
+    # Merge pair counts dictionaries
+    merged_pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    for _, pair_counts, _ in results:
+        for pair, count in pair_counts.items():
+            merged_pair_counts[pair] += count
+
+    # Sum token counts
+    total_token_count = sum(token_count for _, _, token_count in results)
+
+    return merged_feature_counts, dict(merged_pair_counts), total_token_count
+
+
+def compute_coactivation_counts(
+    run_dir: Path | str,
+    *,
+    first_token_idx: int = 0,
+    last_token_idx: int = 1024,
+    num_workers: int = 1,
+) -> CoactivationCounts:
+    """Accumulate feature counts and pairwise intersections from activation shards.
+
+    Args:
+        run_dir: Directory containing activations/ and metadata/
+        first_token_idx: Inclusive starting token index per document
+        last_token_idx: Exclusive ending token index per document
+        num_workers: Number of parallel workers (default: 1 for sequential processing)
+    """
+    run_path = Path(run_dir)
+    activations_dir = run_path / "activations"
+    metadata_dir = run_path / "metadata"
+
+    feature_counts_path = metadata_dir / "feature_counts.parquet"
+    if not feature_counts_path.exists():
+        raise FileNotFoundError(f"Missing feature counts at {feature_counts_path}")
+
+    counts_table = pq.read_table(feature_counts_path, columns=["count"])
+    num_features = counts_table.num_rows
+
+    if first_token_idx < 0:
+        raise ValueError("first_token_idx must be non-negative")
+    if last_token_idx <= first_token_idx:
+        raise ValueError("last_token_idx must be greater than first_token_idx")
+
+    shard_paths = sorted(activations_dir.glob("shard=*"), key=lambda p: p.name)
+
+    if num_workers <= 1:
+        # Sequential processing (original code path)
+        feature_counts = np.zeros(num_features, dtype=np.int64)
+        token_count = 0
+        pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+
+        for shard_path in tqdm(shard_paths, desc="Shards", leave=False):
+            file_path = shard_path / "data.parquet"
+            table = pq.read_table(file_path, columns=["position_in_doc", "feature_ids"])
+            positions: Iterable[int] = table.column("position_in_doc").to_pylist()
+            feature_lists: Iterable[Iterable[int]] = table.column("feature_ids").to_pylist()
+
+            for position, features in zip(positions, feature_lists):
+                if position < first_token_idx or position >= last_token_idx:
+                    continue
+                token_count += 1
+                feats = [int(f) for f in features]
+                if not feats:
+                    continue
+                for fid in feats:
+                    feature_counts[fid] += 1
+                if len(feats) < 2:
+                    continue
+                for a, b in combinations(feats, 2):
+                    if a > b:
+                        a, b = b, a
+                    pair_counts[(a, b)] += 1
+
+        pair_counts_dict = dict(pair_counts)
+    else:
+        # Parallel processing
+        # Distribute shards across workers in interleaved fashion
+        worker_batches: List[List[Path]] = [[] for _ in range(num_workers)]
+        for idx, shard_path in enumerate(shard_paths):
+            worker_batches[idx % num_workers].append(shard_path)
+
+        # Process batches in parallel
+        print(f"Processing {len(shard_paths)} shards with {num_workers} workers...")
+        with Pool(processes=num_workers) as pool:
+            tasks = [
+                (batch, num_features, first_token_idx, last_token_idx)
+                for batch in worker_batches if batch
+            ]
+            results = pool.starmap(_process_shard_batch, tasks)
+
+        # Merge results
+        print("Merging results...")
+        feature_counts, pair_counts_dict, token_count = _merge_results(results)
+
     return CoactivationCounts(
         feature_counts=feature_counts,
-        pair_counts=dict(pair_counts),
+        pair_counts=pair_counts_dict,
         token_count=token_count,
         first_token_idx=first_token_idx,
         last_token_idx=last_token_idx,

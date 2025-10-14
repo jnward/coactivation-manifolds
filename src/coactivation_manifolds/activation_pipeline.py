@@ -21,6 +21,7 @@ class PipelineConfig:
     max_length: int = 1024
     layer_index: int = 12
     device: str = "cuda"
+    use_device_map: bool = False  # True when model uses device_map="auto"
 
 
 class ActivationPipeline:
@@ -41,8 +42,13 @@ class ActivationPipeline:
         self.config = config
 
         self.device = torch.device(config.device)
-        self.model.to(self.device)
+        self.use_device_map = config.use_device_map
+
+        # Only move model if not using device_map (it's already distributed)
+        if not self.use_device_map:
+            self.model.to(self.device)
         self.model.eval()
+
         if hasattr(self.sae, "to"):
             self.sae.to(self.device)
         if hasattr(self.sae, "eval"):
@@ -78,11 +84,19 @@ class ActivationPipeline:
                 truncation=True,
                 max_length=self.config.max_length,
             )
-            tokenized = {k: v.to(self.device) for k, v in tokenized.items()}
+
+            # Only manually move to device if not using device_map
+            if not self.use_device_map:
+                tokenized = {k: v.to(self.device) for k, v in tokenized.items()}
 
             with torch.no_grad():
                 outputs = self.model(**tokenized, output_hidden_states=True, use_cache=False)
                 hidden_states = outputs.hidden_states[self.config.layer_index]
+
+                # Move hidden states to SAE device if needed
+                if hidden_states.device != self.device:
+                    hidden_states = hidden_states.to(self.device)
+
                 sae_inputs = (
                     hidden_states
                     if hidden_states.dtype == self._sae_input_dtype

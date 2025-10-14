@@ -20,6 +20,9 @@ from coactivation_manifolds.sae_loader import (
     load_sae,
 )
 
+DEFAULT_MODEL_NAME = "google/gemma-2-9b"
+DEFAULT_LAYER = 20
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Log SAE activations to Parquet shards")
@@ -40,8 +43,13 @@ def parse_args() -> argparse.Namespace:
         help="Stream the dataset instead of downloading locally (default: True)",
     )
     parser.add_argument("--device", default="cuda", help="Device for model/SAE (e.g., cuda, cuda:1, cpu)")
-    parser.add_argument("--layer-index", type=int, default=12, help="Model layer to tap for activations")
-    parser.add_argument("--model-name", default="google/gemma-2-2b", help="Hugging Face model id")
+    parser.add_argument(
+        "--multi-gpu",
+        action="store_true",
+        help="Use device_map='auto' to spread model across all available GPUs (recommended for multi-GPU setups)",
+    )
+    parser.add_argument("--layer-index", type=int, default=DEFAULT_LAYER, help="Model layer to tap for activations")
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Hugging Face model id")
     parser.add_argument("--sae-release", default=DEFAULT_SAE_RELEASE, help="sae-lens release identifier")
     parser.add_argument("--sae-name", default=DEFAULT_SAE_NAME, help="sae-lens SAE identifier within the release")
     return parser.parse_args()
@@ -60,14 +68,28 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     tokenizer.padding_side = "left"
 
+    # Multi-GPU support
     torch_dtype = torch.bfloat16 if "cuda" in args.device else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch_dtype)
-    model.to(args.device)
+    if args.multi_gpu:
+        print(f"Loading model with device_map='auto' across {torch.cuda.device_count()} GPUs")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=torch_dtype,
+            device_map="auto",
+        )
+        # SAE goes on the primary device where hidden states will be
+        sae_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        pipeline_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch_dtype)
+        model.to(args.device)
+        sae_device = args.device
+        pipeline_device = args.device
 
     handle: SAEHandle = load_sae(
         sae_release=args.sae_release,
         sae_name=args.sae_name,
-        device=args.device,
+        device=sae_device,
     )
 
     dataset = load_dataset(
@@ -85,7 +107,8 @@ def main() -> None:
         batch_size=args.batch_size,
         max_length=args.max_length,
         layer_index=args.layer_index,
-        device=args.device,
+        device=pipeline_device,
+        use_device_map=args.multi_gpu,
     )
 
     pipeline = ActivationPipeline(model, tokenizer, handle.sae, writer, config)

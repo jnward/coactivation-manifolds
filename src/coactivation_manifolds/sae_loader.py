@@ -4,8 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-DEFAULT_SAE_RELEASE = "gemma-scope-2b-pt-res-canonical"
-DEFAULT_SAE_NAME = "layer_12/width_65k/canonical"
+DEFAULT_SAE_RELEASE = "gemma-scope-9b-pt-res-canonical"
+DEFAULT_SAE_NAME = "layer_20/width_16k/canonical"
 
 
 @dataclass(frozen=True)

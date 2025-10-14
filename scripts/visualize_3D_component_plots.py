@@ -26,7 +26,7 @@ from coactivation_manifolds.component_graph import ComponentGraphConfig, compute
 GRID_COLUMNS = 4
 GRID_ROWS = 2
 PAGE_SIZE = GRID_COLUMNS * GRID_ROWS
-FEATURE_BASE_URL = "https://www.neuronpedia.org/gemma-2-2b/12-gemmascope-res-65k/"
+FEATURE_BASE_URL = "https://www.neuronpedia.org/gemma-2-9b/20-gemmascope-res-16k/"
 
 
 @dataclass
@@ -41,6 +41,7 @@ class PCAResult:
     pca_components: np.ndarray
     pca_mean: np.ndarray
     snippets: List[str]
+    n_pcs: int  # Number of PCs computed
 
     @property
     def feature_count(self) -> int:
@@ -143,6 +144,12 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for the dashboard (defaults to metadata/component_pca_3d)",
     )
     parser.add_argument(
+        "--max-pcs",
+        type=int,
+        default=None,
+        help="Maximum number of principal components to compute (default: min(10, feature_count))",
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
         help="Disable tqdm progress bars",
@@ -241,6 +248,7 @@ def generate_pca_results(
     snippets: List[List[str]],
     *,
     min_activations: int,
+    max_pcs: Optional[int],
     show_progress: bool,
 ) -> List[PCAResult]:
     results: List[PCAResult] = []
@@ -259,8 +267,16 @@ def generate_pca_results(
         activation_counts = np.count_nonzero(matrix > 0.0, axis=1).astype(np.int8)
         if activation_counts.size == 0:
             continue
+
+        # Compute as many PCs as possible (up to max_pcs)
+        n_features = matrix.shape[1]
+        n_samples = matrix.shape[0]
+        default_max_pcs = min(10, n_features)
+        n_components = min(n_features, n_samples, max_pcs if max_pcs is not None else default_max_pcs)
+        n_components = max(3, n_components)  # Need at least 3 for 3D plots
+
         try:
-            pca = PCA(n_components=3)
+            pca = PCA(n_components=n_components)
             pcs = pca.fit_transform(matrix)
         except Exception:
             continue
@@ -286,12 +302,28 @@ def generate_pca_results(
                 pca_components=pca.components_.copy(),
                 pca_mean=pca.mean_.copy(),
                 snippets=texts,
+                n_pcs=n_components,
             )
         )
     return results
 
 
-def _make_figure_spec(entry: PCAResult) -> dict:
+def generate_pc_triplets(n_pcs: int) -> List[tuple[int, int, int]]:
+    """Generate consecutive PC triplets for 3D visualization.
+
+    For n_pcs=5: returns [(0,1,2), (1,2,3), (2,3,4)]
+    For n_pcs=3: returns [(0,1,2)]
+    """
+    if n_pcs < 3:
+        return []
+    triplets = []
+    for i in range(n_pcs - 2):
+        triplets.append((i, i + 1, i + 2))
+    return triplets
+
+
+def _make_figure_spec(entry: PCAResult, pc_x: int = 0, pc_y: int = 1, pc_z: int = 2) -> dict:
+    """Generate a 3D plot spec for the specified PC indices."""
     counts = entry.activation_counts.astype(int)
     snippets = entry.snippets if entry.snippets else []
     customdata = [
@@ -309,17 +341,19 @@ def _make_figure_spec(entry: PCAResult) -> dict:
             colors.append("orange")
         else:
             colors.append("blue")
+
+    pc_labels = [f"PC{pc_x+1}", f"PC{pc_y+1}", f"PC{pc_z+1}"]
     hovertemplate = (
         f"Comp {entry.component_index}<br>"
-        "PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<br>"
+        f"{pc_labels[0]}: %{{x:.3f}}<br>{pc_labels[1]}: %{{y:.3f}}<br>{pc_labels[2]}: %{{z:.3f}}<br>"
         f"Features: {', '.join(str(fid) for fid in entry.feature_ids[:3])}" "<br>"
         "Active features: %{customdata[0]}<br>"
         "Text: %{customdata[1]}<extra></extra>"
     )
     trace = go.Scatter3d(
-        x=entry.pcs[:, 0],
-        y=entry.pcs[:, 1],
-        z=entry.pcs[:, 2],
+        x=entry.pcs[:, pc_x],
+        y=entry.pcs[:, pc_y],
+        z=entry.pcs[:, pc_z],
         mode="markers",
         marker=dict(size=3, opacity=0.65, color=colors),
         customdata=customdata,
@@ -328,24 +362,30 @@ def _make_figure_spec(entry: PCAResult) -> dict:
     )
     fig = go.Figure(data=[trace])
 
+    # Project feature vectors onto the selected PC subspace
     components_t = entry.pca_components.T
-    baseline = -entry.pca_mean @ components_t
-    norms = np.linalg.norm(entry.pcs, axis=1)
+    # Extract only the PCs we're visualizing
+    selected_pcs = np.array([pc_x, pc_y, pc_z])
+    selected_components = entry.pca_components[selected_pcs, :]
+    components_t_3d = selected_components.T
+    baseline_3d = -entry.pca_mean @ components_t_3d
+
+    norms = np.linalg.norm(entry.pcs[:, selected_pcs], axis=1)
     target_length = float(np.percentile(norms, 90)) if norms.size else 1.0
     if not math.isfinite(target_length) or target_length <= 0:
         target_length = 1.0
     for local_idx, fid in enumerate(entry.feature_ids):
-        direction = components_t[local_idx]
+        direction = components_t_3d[local_idx]
         length = float(np.linalg.norm(direction))
         if not math.isfinite(length) or length == 0.0:
             continue
         scaled = direction * (target_length / length)
-        end_point = baseline + scaled
+        end_point = baseline_3d + scaled
         fig.add_trace(
             go.Scatter3d(
-                x=[float(baseline[0]), float(end_point[0])],
-                y=[float(baseline[1]), float(end_point[1])],
-                z=[float(baseline[2]), float(end_point[2])],
+                x=[float(baseline_3d[0]), float(end_point[0])],
+                y=[float(baseline_3d[1]), float(end_point[1])],
+                z=[float(baseline_3d[2]), float(end_point[2])],
                 mode="lines",
                 line=dict(color="black", width=2),
                 name=f"Feature {fid}",
@@ -355,9 +395,9 @@ def _make_figure_spec(entry: PCAResult) -> dict:
         )
     fig.update_layout(
         scene=dict(
-            xaxis=dict(title="PC1", showticklabels=False, zeroline=False),
-            yaxis=dict(title="PC2", showticklabels=False, zeroline=False),
-            zaxis=dict(title="PC3", showticklabels=False, zeroline=False),
+            xaxis=dict(title=pc_labels[0], showticklabels=False, zeroline=False),
+            yaxis=dict(title=pc_labels[1], showticklabels=False, zeroline=False),
+            zaxis=dict(title=pc_labels[2], showticklabels=False, zeroline=False),
             bgcolor="rgba(0,0,0,0)",
             aspectmode="cube",
         ),
@@ -372,18 +412,34 @@ def _make_figure_spec(entry: PCAResult) -> dict:
 
 
 def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
-    figures = [_make_figure_spec(entry) for entry in results]
-    figure_strings = [json.dumps(spec, separators=(",", ":")) for spec in figures]
+    # Generate multiple figure specs per component (one per PC triplet)
+    all_figure_specs = []
+    components_payload = []
 
-    components_payload = [
-        {
+    for entry in results:
+        triplets = generate_pc_triplets(entry.n_pcs)
+        component_figures = []
+
+        for pc_x, pc_y, pc_z in triplets:
+            spec = _make_figure_spec(entry, pc_x, pc_y, pc_z)
+            component_figures.append(spec)
+
+        all_figure_specs.append(component_figures)
+
+        components_payload.append({
             "component_index": entry.component_index,
             "token_count": entry.token_count,
             "feature_ids": entry.feature_ids,
             "variance": [float(v) for v in entry.variance_ratio],
             "count_hist": entry.count_hist,
-        }
-        for entry in results
+            "n_pcs": entry.n_pcs,
+            "pc_triplets": triplets,
+        })
+
+    # Serialize figure specs as nested arrays
+    figure_strings = [
+        [json.dumps(spec, separators=(",", ":")) for spec in comp_figs]
+        for comp_figs in all_figure_specs
     ]
 
     total_pages = max(1, math.ceil(len(results) / PAGE_SIZE))
@@ -394,6 +450,11 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
             (
                 "        <div class=\"cell\" data-cell=\"{idx}\">\n"
                 "          <div class=\"cell-info\" id=\"info-{idx}\"></div>\n"
+                "          <div class=\"pc-triplet-nav\" id=\"pc-nav-{idx}\" style=\"display:none; margin-bottom: 0.3rem;\">\n"
+                "            <button class=\"triplet-prev\" data-cell=\"{idx}\">◀</button>\n"
+                "            <span class=\"triplet-indicator\" id=\"triplet-ind-{idx}\"></span>\n"
+                "            <button class=\"triplet-next\" data-cell=\"{idx}\">▶</button>\n"
+                "          </div>\n"
                 "          <div class=\"plot-area\" id=\"plot-{idx}\"></div>\n"
                 "          <div class=\"cell-actions\">\n"
                 "            <button class=\"feature-button\" data-cell=\"{idx}\" data-slot=\"0\" data-feature=\"\">Feature 1</button>\n"
@@ -430,6 +491,10 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
     .cell {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 0.5rem; display: flex; flex-direction: column; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }}
     .cell-info {{ font-size: 0.72rem; line-height: 1.3; margin-bottom: 0.5rem; color: #222; min-height: 4.8em; }}
     .plot-area {{ flex: 1 1 auto; min-height: 260px; border: 1px solid #eee; border-radius: 4px; background: #fafafa; }}
+    .pc-triplet-nav {{ display: flex; align-items: center; gap: 0.4rem; font-size: 0.7rem; }}
+    .pc-triplet-nav button {{ padding: 0.2rem 0.5rem; font-size: 0.7rem; cursor: pointer; }}
+    .pc-triplet-nav button:disabled {{ cursor: not-allowed; opacity: 0.4; }}
+    .triplet-indicator {{ font-weight: 500; color: #555; }}
     .cell-actions {{ margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }}
     .cell-actions button {{ padding: 0.3rem 0.6rem; font-size: 0.72rem; cursor: pointer; }}
     .cell-actions button:disabled {{ cursor: not-allowed; opacity: 0.45; }}
@@ -456,13 +521,18 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
     const FEATURE_BASE_URL = \"{FEATURE_BASE_URL}\";
 
     const assignments = new Array(PAGE_SIZE).fill(null);
+    const tripletIndices = new Array(PAGE_SIZE).fill(0);  // Track which PC triplet is shown per cell
     let currentPage = 0;
 
     function plotId(cell) {{ return 'plot-' + String(cell); }}
     function infoId(cell) {{ return 'info-' + String(cell); }}
+    function pcNavId(cell) {{ return 'pc-nav-' + String(cell); }}
+    function tripletIndId(cell) {{ return 'triplet-ind-' + String(cell); }}
 
-    function cloneSpec(idx) {{
-      return JSON.parse(FIGURE_STRINGS[idx]);
+    function cloneSpec(compIdx, tripletIdx) {{
+      const figureArray = FIGURE_STRINGS[compIdx];
+      if (!figureArray || tripletIdx >= figureArray.length) return null;
+      return JSON.parse(figureArray[tripletIdx]);
     }}
 
     function purgeCell(cell) {{
@@ -511,14 +581,46 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
       if (next) next.disabled = currentPage >= TOTAL_PAGES - 1;
     }}
 
+    function updateTripletNav(cell) {{
+      const globalIndex = assignments[cell];
+      if (globalIndex === null || globalIndex >= TOTAL_COMPONENTS) return;
+
+      const metadata = COMPONENTS[globalIndex];
+      const numTriplets = metadata.pc_triplets ? metadata.pc_triplets.length : 1;
+      const nav = document.getElementById(pcNavId(cell));
+
+      if (numTriplets <= 1) {{
+        if (nav) nav.style.display = 'none';
+        return;
+      }}
+
+      if (nav) nav.style.display = 'flex';
+      const indicator = document.getElementById(tripletIndId(cell));
+      const tripletIdx = tripletIndices[cell] || 0;
+      const triplet = metadata.pc_triplets[tripletIdx];
+      if (indicator) {{
+        const label = 'PC' + (triplet[0]+1) + '-' + (triplet[1]+1) + '-' + (triplet[2]+1) +
+                      ' (' + (tripletIdx+1) + '/' + numTriplets + ')';
+        indicator.textContent = label;
+      }}
+
+      const prevBtn = nav.querySelector('.triplet-prev');
+      const nextBtn = nav.querySelector('.triplet-next');
+      if (prevBtn) prevBtn.disabled = tripletIdx <= 0;
+      if (nextBtn) nextBtn.disabled = tripletIdx >= numTriplets - 1;
+    }}
+
     function assignCell(cell, globalIndex) {{
       assignments[cell] = globalIndex;
+      tripletIndices[cell] = 0;  // Reset to first triplet
       const info = document.getElementById(infoId(cell));
       const buttons = document.querySelectorAll('.feature-button[data-cell="' + cell + '"]');
+      const nav = document.getElementById(pcNavId(cell));
       purgeCell(cell);
 
       if (globalIndex === null || globalIndex >= TOTAL_COMPONENTS) {{
         if (info) info.innerHTML = '';
+        if (nav) nav.style.display = 'none';
         buttons.forEach(function(button) {{
           button.disabled = true;
           button.dataset.feature = '';
@@ -543,16 +645,26 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
           button.textContent = 'Feature ' + String(slot + 1) + ': ' + String(featureId);
         }}
       }});
+
+      updateTripletNav(cell);
     }}
 
-    function loadPlotByCell(cell) {{
+    function loadPlotByCell(cell, tripletIdx) {{
       const globalIndex = assignments[cell];
       if (globalIndex === null || globalIndex === undefined) return;
+      if (tripletIdx === undefined) tripletIdx = tripletIndices[cell] || 0;
+
       const container = document.getElementById(plotId(cell));
-      if (!container || container.dataset.loaded === 'true') return;
-      const spec = cloneSpec(globalIndex);
+      if (!container) return;
+
+      purgeCell(cell);
+      const spec = cloneSpec(globalIndex, tripletIdx);
+      if (!spec) return;
+
       Plotly.newPlot(container, spec.data, spec.layout, spec.config || {{}});
       container.dataset.loaded = 'true';
+      tripletIndices[cell] = tripletIdx;
+      updateTripletNav(cell);
     }}
 
     function populatePage(page) {{
@@ -590,6 +702,31 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
           if (!featureId) return;
           const url = FEATURE_BASE_URL + featureId;
           window.open(url, '_blank', 'noopener');
+        }});
+      }});
+
+      // PC triplet navigation
+      document.querySelectorAll('.triplet-prev').forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+          const cell = parseInt(btn.dataset.cell, 10);
+          const currentIdx = tripletIndices[cell] || 0;
+          if (currentIdx > 0) {{
+            loadPlotByCell(cell, currentIdx - 1);
+          }}
+        }});
+      }});
+
+      document.querySelectorAll('.triplet-next').forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+          const cell = parseInt(btn.dataset.cell, 10);
+          const globalIndex = assignments[cell];
+          if (globalIndex === null) return;
+          const metadata = COMPONENTS[globalIndex];
+          const numTriplets = metadata.pc_triplets ? metadata.pc_triplets.length : 1;
+          const currentIdx = tripletIndices[cell] || 0;
+          if (currentIdx < numTriplets - 1) {{
+            loadPlotByCell(cell, currentIdx + 1);
+          }}
         }});
       }});
 
@@ -679,6 +816,7 @@ def main() -> None:
         matrices,
         snippet_lists,
         min_activations=args.min_activations,
+        max_pcs=args.max_pcs,
         show_progress=not args.no_progress,
     )
 
