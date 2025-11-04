@@ -13,15 +13,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from coactivation_manifolds.activation_pipeline import ActivationPipeline, PipelineConfig
 from coactivation_manifolds.activation_reader import FeatureIndexBuilder, FeatureIndexConfig
 from coactivation_manifolds.activation_writer import ActivationWriter
-from coactivation_manifolds.sae_loader import (
+from coactivation_manifolds.default_config import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_LAYER,
     DEFAULT_SAE_NAME,
     DEFAULT_SAE_RELEASE,
-    SAEHandle,
-    load_sae,
 )
-
-DEFAULT_MODEL_NAME = "google/gemma-2-9b"
-DEFAULT_LAYER = 20
+from coactivation_manifolds.sae_loader import SAEHandle, load_sae
 
 
 def parse_args() -> argparse.Namespace:

@@ -5,6 +5,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Iterable, Iterator, List
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 import numpy as np
 import pyarrow as pa
@@ -13,6 +19,7 @@ from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
+from coactivation_manifolds.default_config import DEFAULT_MODEL_NAME
 
 DEFAULT_DATASET = "monology/pile-uncopyrighted"
 
@@ -24,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default=DEFAULT_DATASET, help="HF dataset name if --dataset-path is not provided")
     parser.add_argument("--dataset-config", default=None, help="Optional dataset config name")
     parser.add_argument("--split", default="train", help="Dataset split to read (default: train)")
-    parser.add_argument("--tokenizer", default="google/gemma-2-2b", help="Tokenizer name or path")
+    parser.add_argument("--tokenizer", default=DEFAULT_MODEL_NAME, help=f"Tokenizer name or path (default: {DEFAULT_MODEL_NAME})")
     parser.add_argument("--text-field", default="text", help="Field containing raw text")
     parser.add_argument("--max-length", type=int, default=1024, help="Tokenizer max length used during logging")
     parser.add_argument("--batch-size", type=int, default=4, help="Samples per batch while rebuilding tokens")

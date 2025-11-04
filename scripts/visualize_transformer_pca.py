@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Project multi-feature clusters onto 3D PCA space and export a Plotly HTML dashboard."""
+"""Visualize SVD of transformer hidden states (not SAE activations) with projected decoder directions."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,11 +18,22 @@ if str(SRC_DIR) not in sys.path:
 import numpy as np
 import plotly.graph_objects as go
 import pyarrow.parquet as pq
-from sklearn.decomposition import PCA
+import torch
+from datasets import load_dataset
+from dotenv import load_dotenv
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from coactivation_manifolds.component_graph import ComponentGraphConfig, compute_components
-from coactivation_manifolds.default_config import NEURONPEDIA_BASE_URL
+from coactivation_manifolds.component_graph import (
+    ComponentGraphConfig,
+    compute_components,
+    _resolve_decoder_vectors,
+)
+from coactivation_manifolds.default_config import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_LAYER,
+    NEURONPEDIA_BASE_URL,
+)
 
 GRID_COLUMNS = 4
 GRID_ROWS = 2
@@ -43,6 +54,8 @@ class PCAResult:
     pca_mean: np.ndarray
     snippets: List[str]
     n_pcs: int  # Number of PCs computed
+    decoder_directions: np.ndarray  # [n_features, d_model] SAE decoder vectors
+    highlight_mask: List[bool]
 
     @property
     def feature_count(self) -> int:
@@ -51,12 +64,62 @@ class PCAResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot 3D PCA projections for multi-feature coactivation clusters"
+        description="Plot 3D SVD projections of transformer hidden states for coactivation clusters"
     )
     parser.add_argument(
         "run_dir",
         type=Path,
         help="Activation run directory containing activations/ and metadata/",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="monology/pile-uncopyrighted",
+        help="Dataset name or local path (default: monology/pile-uncopyrighted)",
+    )
+    parser.add_argument(
+        "--dataset-split",
+        type=str,
+        default="train",
+        help="Dataset split (default: train)",
+    )
+    parser.add_argument(
+        "--dataset-config",
+        default=None,
+        help="Optional dataset config name",
+    )
+    parser.add_argument(
+        "--text-field",
+        default="text",
+        help="Field containing raw text (default: text)",
+    )
+    parser.add_argument(
+        "--model-name",
+        default=DEFAULT_MODEL_NAME,
+        help=f"Hugging Face model id (default: {DEFAULT_MODEL_NAME})",
+    )
+    parser.add_argument(
+        "--layer-index",
+        type=int,
+        default=DEFAULT_LAYER,
+        help=f"Model layer to extract hidden states from (default: {DEFAULT_LAYER})",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Device for model inference (default: cuda)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Batch size for model inference (default: 4)",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=1024,
+        help="Max sequence length (default: 1024)",
     )
     parser.add_argument(
         "--jaccard-threshold",
@@ -93,17 +156,6 @@ def parse_args() -> argparse.Namespace:
         help="sae-lens SAE identifier within the release",
     )
     parser.add_argument(
-        "--device",
-        default="cpu",
-        help="Device for loading SAE when generating decoder directions (default: cpu)",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=1_000_000,
-        help="Batch size for streaming coactivations (default: 1e6)",
-    )
-    parser.add_argument(
         "--first-token-idx",
         type=int,
         default=None,
@@ -136,73 +188,106 @@ def parse_args() -> argparse.Namespace:
         "--min-activations",
         type=int,
         default=16,
-        help="Minimum activation rows required to run PCA for a component",
+        help="Minimum activation rows required to run SVD for a component",
+    )
+    parser.add_argument(
+        "--max-tokens-per-component",
+        type=int,
+        default=10000,
+        help="Maximum tokens to use per component for SVD (default: 10000)",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory for the dashboard (defaults to metadata/component_pca_3d)",
-    )
-    parser.add_argument(
-        "--max-pcs",
-        type=int,
-        default=None,
-        help="Maximum number of principal components to compute (default: min(10, feature_count))",
+        help="Output directory for the dashboard (defaults to metadata/transformer_pca_3d)",
     )
     parser.add_argument(
         "--no-progress",
         action="store_true",
         help="Disable tqdm progress bars",
     )
+    parser.add_argument(
+        "--stream-dataset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream the dataset instead of downloading locally (default: True)",
+    )
     return parser.parse_args()
 
 
-def collect_component_matrices(
+def collect_token_metadata(
     run_dir: Path,
     components: List[List[int]],
     *,
     first_token_idx: int,
     last_token_idx: int | None,
+    max_tokens_per_component: int,
     show_progress: bool,
-) -> tuple[List[np.ndarray], List[List[str]]]:
+    highlight_substring: str | None = None,
+) -> tuple[List[List[Tuple[int, int, int]]], List[List[str]], List[List[bool]]]:
+    """Collect (doc_id, position_in_doc, token_index) tuples plus snippet metadata.
+
+    Returns:
+        tokens_per_component: List of [(doc_id, position_in_doc, token_index), ...] per component
+        snippets_per_component: List of [snippet_text, ...] per component
+        highlight_masks: List of [bool, ...] indicating substring matches per token
+    """
     if not components:
         return [], []
 
     activations_dir = run_dir / "activations"
-    mapping: dict[int, tuple[int, int]] = {}
-    comp_lengths: List[int] = []
+    mapping: dict[int, int] = {}  # feature_id -> component_index
     for comp_idx, comp in enumerate(components):
-        comp_lengths.append(len(comp))
-        for local_idx, fid in enumerate(comp):
-            mapping[int(fid)] = (comp_idx, local_idx)
+        for fid in comp:
+            mapping[int(fid)] = comp_idx
 
-    records: List[List[np.ndarray]] = [[] for _ in components]
-    snippet_storage: List[List[str]] = [[] for _ in components]
+    tokens_per_component: List[List[Tuple[int, int, int]]] = [[] for _ in components]
+    snippets_per_component: List[List[str]] = [[] for _ in components]
+    highlight_masks: List[List[bool]] = [[] for _ in components]
+    seen_tokens_per_component: List[set] = [set() for _ in components]
 
     shard_paths = sorted(activations_dir.glob("shard=*"), key=lambda p: p.name)
     shard_iter = shard_paths
     if show_progress:
-        shard_iter = tqdm(shard_paths, desc="Shards", leave=False)
+        shard_iter = tqdm(shard_paths, desc="Scanning shards", leave=False)
+
+    highlight_substring = highlight_substring.lower() if highlight_substring else None
+
+    def _extract_center_token(snippet: str) -> str:
+        if not snippet:
+            return ""
+        if "«" in snippet and "»" in snippet:
+            try:
+                return snippet.split("«", 1)[1].split("»", 1)[0]
+            except IndexError:
+                return snippet
+        return snippet
 
     lower_bound = max(0, first_token_idx)
 
     for shard_path in shard_iter:
         file_path = shard_path / "data.parquet"
         pf = pq.ParquetFile(file_path)
+
+        # Check for token_text
         sidecar_path = shard_path / "token_text.parquet"
         shard_snippets: Optional[List[str]] = None
         sidecar_offset = 0
         has_inline_snippets = "token_text" in pf.schema.names
         if not has_inline_snippets and sidecar_path.exists():
             shard_snippets = pq.read_table(sidecar_path, columns=["token_text"]).column(0).to_pylist()
-        columns = ["position_in_doc", "feature_ids", "activations"]
+
+        columns = ["doc_id", "position_in_doc", "token_index", "feature_ids"]
         if has_inline_snippets:
             columns.append("token_text")
+
         for batch in pf.iter_batches(columns=columns):
+            doc_ids = batch.column("doc_id").to_numpy(zero_copy_only=False)
             positions = batch.column("position_in_doc").to_numpy(zero_copy_only=False)
+            token_indices = batch.column("token_index").to_numpy(zero_copy_only=False)
             feat_lists = batch.column("feature_ids").to_pylist()
-            act_lists = batch.column("activations").to_pylist()
+
             if has_inline_snippets:
                 text_list = batch.column("token_text").to_pylist()
             elif shard_snippets is not None:
@@ -210,87 +295,219 @@ def collect_component_matrices(
                 sidecar_offset += len(positions)
             else:
                 text_list = [""] * len(positions)
-            for pos, feats, acts, snippet_text in zip(positions, feat_lists, act_lists, text_list):
+
+            for doc_id, pos, token_idx, feats, snippet_text in zip(
+                doc_ids, positions, token_indices, feat_lists, text_list
+            ):
                 if pos < lower_bound:
                     continue
                 if last_token_idx is not None and last_token_idx >= 0 and pos >= last_token_idx:
                     continue
-                comp_hits: dict[int, np.ndarray] = {}
-                for fid, act in zip(feats, acts):
-                    lookup = mapping.get(int(fid))
-                    if lookup is None:
-                        continue
-                    comp_idx, local_idx = lookup
-                    vec = comp_hits.get(comp_idx)
-                    if vec is None:
-                        vec = np.zeros(comp_lengths[comp_idx], dtype=np.float32)
-                        comp_hits[comp_idx] = vec
-                    vec[local_idx] = float(act)
-                for comp_idx, vec in comp_hits.items():
-                    if np.any(vec):
-                        records[comp_idx].append(vec)
-                        snippet_storage[comp_idx].append(snippet_text)
 
-    matrices: List[np.ndarray] = []
-    snippets: List[List[str]] = []
-    for comp_idx, rows in enumerate(records):
-        if rows:
-            matrices.append(np.vstack(rows))
-            snippets.append(snippet_storage[comp_idx])
-        else:
-            matrices.append(np.empty((0, comp_lengths[comp_idx]), dtype=np.float32))
-            snippets.append([])
-    return matrices, snippets
+                # Check which components this token belongs to
+                for fid in feats:
+                    comp_idx = mapping.get(int(fid))
+                    if comp_idx is None:
+                        continue
+
+                    # Avoid duplicates and enforce max tokens
+                    if token_idx in seen_tokens_per_component[comp_idx]:
+                        continue
+                    if len(tokens_per_component[comp_idx]) >= max_tokens_per_component:
+                        continue
+
+                    seen_tokens_per_component[comp_idx].add(token_idx)
+                    tokens_per_component[comp_idx].append((int(doc_id), int(pos), int(token_idx)))
+                    snippets_per_component[comp_idx].append(snippet_text)
+                    if highlight_substring:
+                        center_token = _extract_center_token(snippet_text).lower()
+                        highlight_masks[comp_idx].append(
+                            highlight_substring in center_token
+                        )
+                    else:
+                        highlight_masks[comp_idx].append(False)
+
+    return tokens_per_component, snippets_per_component, highlight_masks
+
+
+def collect_transformer_states(
+    tokens_per_component: List[List[Tuple[int, int, int]]],
+    components: List[List[int]],
+    *,
+    dataset,
+    text_field: str,
+    model_name: str,
+    layer_index: int,
+    device: str,
+    batch_size: int,
+    max_length: int,
+    show_progress: bool,
+) -> List[np.ndarray]:
+    """Re-run model to extract transformer hidden states for specified tokens.
+
+    Returns:
+        List of [n_tokens, d_model] arrays, one per component
+    """
+    # Load model and tokenizer
+    if show_progress:
+        print(f"Loading model {model_name}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+
+    torch_dtype = torch.bfloat16 if "cuda" in device else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype)
+    model.to(device)
+    model.eval()
+
+    # Organize tokens by doc_id
+    doc_to_tokens: Dict[int, List[Tuple[int, int, int, int]]] = {}  # doc_id -> [(comp_idx, position, token_idx, local_idx), ...]
+    for comp_idx, token_list in enumerate(tokens_per_component):
+        for local_idx, (doc_id, position, token_idx) in enumerate(token_list):
+            if doc_id not in doc_to_tokens:
+                doc_to_tokens[doc_id] = []
+            doc_to_tokens[doc_id].append((comp_idx, position, token_idx, local_idx))
+
+    # Sort doc_ids for sequential access
+    doc_ids_needed = sorted(doc_to_tokens.keys())
+
+    # Initialize output matrices
+    d_model = model.config.hidden_size
+    matrices = [
+        np.zeros((len(token_list), d_model), dtype=np.float32)
+        for token_list in tokens_per_component
+    ]
+
+    # Stream through dataset and process needed documents
+    doc_iterator = enumerate(dataset)
+    if show_progress:
+        print(f"Processing {len(doc_ids_needed)} documents...")
+        doc_iterator = tqdm(enumerate(dataset), desc="Documents", total=len(doc_ids_needed), leave=False)
+
+    docs_found = 0
+    for doc_id, sample in doc_iterator:
+        if doc_id not in doc_to_tokens:
+            if docs_found >= len(doc_ids_needed):
+                break
+            continue
+
+        docs_found += 1
+        text = sample[text_field]
+
+        # Tokenize
+        tokenized = tokenizer(
+            [text],
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+        ).to(device)
+
+        # Get hidden states
+        with torch.no_grad():
+            outputs = model(**tokenized, output_hidden_states=True)
+            hidden_states = outputs.hidden_states[layer_index]  # [1, seq_len, d_model]
+
+        # Convert to float32 first (numpy doesn't support bfloat16)
+        hidden_np = hidden_states[0].float().cpu().numpy()  # [seq_len, d_model]
+
+        # Map positions to hidden states
+        for comp_idx, position, token_idx, local_idx in doc_to_tokens[doc_id]:
+            if position < hidden_np.shape[0]:
+                matrices[comp_idx][local_idx] = hidden_np[position]
+
+    if show_progress:
+        print(f"Collected hidden states for {docs_found} documents")
+
+    return matrices
 
 
 def generate_pca_results(
     components: List[List[int]],
     matrices: List[np.ndarray],
     snippets: List[List[str]],
+    tokens_metadata: List[List[Tuple[int, int, int]]],
+    highlight_masks: List[List[bool]],
+    decoder_directions: np.ndarray,
+    b_dec: np.ndarray,
     *,
     min_activations: int,
-    max_pcs: Optional[int],
     show_progress: bool,
 ) -> List[PCAResult]:
+    """Run SVD on SAE decoder directions and project activations onto this basis.
+
+    The SVD basis is computed from decoder directions (without centering), so it represents
+    the geometry of the SAE feature subspace relative to the origin. Activations are centered
+    at b_dec and projected onto this feature-defined basis.
+
+    Using SVD (not PCA) means we don't center the decoders at their mean. This makes the
+    origin in the visualization space correspond to b_dec (the SAE's natural baseline).
+
+    Args:
+        matrices: List of [n_tokens, d_model] hidden state matrices
+        decoder_directions: [n_total_features, d_model] SAE decoder matrix
+        b_dec: [d_model] SAE decoder bias (natural origin for feature geometry)
+        highlight_masks: Boolean flags indicating substring matches per token
+    """
     results: List[PCAResult] = []
     indices = range(len(components))
     if show_progress:
-        indices = tqdm(indices, desc="Components", leave=False)
+        indices = tqdm(indices, desc="Computing SVD", leave=False)
 
     for idx in indices:
         comp = components[idx]
         matrix = matrices[idx]
         texts = snippets[idx] if idx < len(snippets) else []
-        if matrix.shape[1] < 3:
-            continue
+        token_meta = tokens_metadata[idx]
+        highlights = highlight_masks[idx] if idx < len(highlight_masks) else []
+
         if matrix.shape[0] < max(min_activations, 3):
             continue
-        activation_counts = np.count_nonzero(matrix > 0.0, axis=1).astype(np.int8)
-        if activation_counts.size == 0:
-            continue
 
-        # Compute as many PCs as possible (up to max_pcs)
-        n_features = matrix.shape[1]
-        n_samples = matrix.shape[0]
-        default_max_pcs = min(10, n_features)
-        n_components = min(n_features, n_samples, max_pcs if max_pcs is not None else default_max_pcs)
+        # Center activations at b_dec (SAE's natural origin)
+        # The SAE decoders were learned relative to this baseline
+        matrix_centered = matrix - b_dec
+
+        # Count how many features are active per token (from metadata)
+        activation_counts = np.ones(matrix.shape[0], dtype=np.int8)
+
+        # Extract decoder directions for this component
+        comp_decoders = np.array([decoder_directions[fid] for fid in comp], dtype=np.float32)
+
+        # Compute SVD on decoder directions (without centering)
+        # This defines the subspace in terms of SAE feature geometry relative to b_dec
+        n_features = len(comp)
+        d_model = matrix.shape[1]
+        n_components = min(n_features, d_model)  # Limited by decoder matrix dims
         n_components = max(3, n_components)  # Need at least 3 for 3D plots
 
         try:
-            pca = PCA(n_components=n_components)
-            pcs = pca.fit_transform(matrix)
+            # Use SVD (no centering) to find principal directions in decoder subspace
+            U, S, Vt = np.linalg.svd(comp_decoders, full_matrices=False)
+            basis_components = Vt[:n_components]  # [n_components, d_model]
+
+            # Project centered activations (centered at b_dec) onto SVD basis
+            pcs = matrix_centered @ basis_components.T
+
+            # Compute variance explained from singular values
+            total_var = np.sum(S**2)
+            var = (S[:n_components]**2) / total_var if total_var > 0 else np.zeros(n_components, dtype=np.float32)
         except Exception:
             continue
-        var = pca.explained_variance_ratio_
-        hist = np.bincount(activation_counts)
-        one = int(hist[1]) if hist.size > 1 else 0
-        two = int(hist[2]) if hist.size > 2 else 0
-        three_plus = int(hist[3:].sum()) if hist.size > 3 else 0
-        count_hist = [one, two, three_plus]
-        if len(texts) < pcs.shape[0]:
-            texts = texts + [""] * (pcs.shape[0] - len(texts))
+
+        # Placeholder histogram (we don't track SAE activation counts in this version)
+        count_hist = [0, 0, matrix.shape[0]]
+
+        n_rows = pcs.shape[0]
+        if len(texts) < n_rows:
+            texts = texts + [""] * (n_rows - len(texts))
         else:
-            texts = texts[: pcs.shape[0]]
+            texts = texts[:n_rows]
+
+        if len(highlights) < n_rows:
+            highlights = highlights + [False] * (n_rows - len(highlights))
+        else:
+            highlights = highlights[:n_rows]
+
         results.append(
             PCAResult(
                 component_index=idx,
@@ -300,10 +517,12 @@ def generate_pca_results(
                 token_count=matrix.shape[0],
                 activation_counts=activation_counts,
                 count_hist=count_hist,
-                pca_components=pca.components_.copy(),
-                pca_mean=pca.mean_.copy(),
+                pca_components=basis_components.copy(),  # SVD components (no centering)
+                pca_mean=np.zeros(d_model, dtype=np.float32),  # No centering, origin is b_dec
                 snippets=texts,
                 n_pcs=n_components,
+                decoder_directions=comp_decoders,
+                highlight_mask=highlights,
             )
         )
     return results
@@ -324,81 +543,102 @@ def generate_pc_triplets(n_pcs: int) -> List[tuple[int, int, int]]:
 
 
 def _make_figure_spec(entry: PCAResult, pc_x: int = 0, pc_y: int = 1, pc_z: int = 2) -> dict:
-    """Generate a 3D plot spec for the specified PC indices."""
+    """Generate a 3D plot spec for the specified component indices with decoder directions."""
     counts = entry.activation_counts.astype(int)
     snippets = entry.snippets if entry.snippets else []
+    highlight_mask = entry.highlight_mask if entry.highlight_mask else [False] * len(counts)
+    if len(highlight_mask) < len(counts):
+        highlight_mask = highlight_mask + [False] * (len(counts) - len(highlight_mask))
+    else:
+        highlight_mask = highlight_mask[: len(counts)]
+
     customdata = [
-        [int(counts[i]), snippets[i] if i < len(snippets) else ""]
+        [
+            int(counts[i]),
+            snippets[i] if i < len(snippets) else "",
+            "match" if highlight_mask[i] else "",
+        ]
         for i in range(len(counts))
     ]
-    colors = []
-    for raw_count in counts:
-        count = int(raw_count)
-        if count <= 0:
-            colors.append("#777777")
-        elif count == 1:
-            colors.append("red")
-        elif count == 2:
-            colors.append("orange")
-        else:
-            colors.append("blue")
+
+    colors = [
+        "rgba(255,130,0,0.85)" if match else "rgba(0,0,255,0.1)"
+        for match in highlight_mask
+    ]
+    sizes = [6 for _ in highlight_mask]
 
     pc_labels = [f"PC{pc_x+1}", f"PC{pc_y+1}", f"PC{pc_z+1}"]
     hovertemplate = (
         f"Comp {entry.component_index}<br>"
         f"{pc_labels[0]}: %{{x:.3f}}<br>{pc_labels[1]}: %{{y:.3f}}<br>{pc_labels[2]}: %{{z:.3f}}<br>"
-        f"Features: {', '.join(str(fid) for fid in entry.feature_ids[:3])}" "<br>"
-        "Active features: %{customdata[0]}<br>"
-        "Text: %{customdata[1]}<extra></extra>"
+        f"Features: {', '.join(str(fid) for fid in entry.feature_ids[:3])}<br>"
+        "Text: %{customdata[1]}<br>"
+        "Highlight: %{customdata[2]}<extra></extra>"
     )
     trace = go.Scatter3d(
         x=entry.pcs[:, pc_x],
         y=entry.pcs[:, pc_y],
         z=entry.pcs[:, pc_z],
         mode="markers",
-        marker=dict(size=3, opacity=0.65, color=colors),
+        marker=dict(size=sizes, color=colors, line=dict(width=0)),
         customdata=customdata,
         name=f"Comp {entry.component_index}",
         hovertemplate=hovertemplate,
     )
     fig = go.Figure(data=[trace])
 
-    # Project feature vectors onto the selected PC subspace
-    components_t = entry.pca_components.T
-    # Extract only the PCs we're visualizing
+    # Project decoder directions onto the selected PC subspace
     selected_pcs = np.array([pc_x, pc_y, pc_z])
-    selected_components = entry.pca_components[selected_pcs, :]
-    components_t_3d = selected_components.T
-    baseline_3d = -entry.pca_mean @ components_t_3d
+    pca_basis_3d = entry.pca_components[selected_pcs, :]  # [3, d_model]
 
+    # Scale factor for visualization
     norms = np.linalg.norm(entry.pcs[:, selected_pcs], axis=1)
     target_length = float(np.percentile(norms, 90)) if norms.size else 1.0
     if not math.isfinite(target_length) or target_length <= 0:
         target_length = 1.0
+
+    # Project each decoder direction
     for local_idx, fid in enumerate(entry.feature_ids):
-        direction = components_t_3d[local_idx]
-        length = float(np.linalg.norm(direction))
-        if not math.isfinite(length) or length == 0.0:
+        decoder_vec = entry.decoder_directions[local_idx]  # [d_model]
+
+        # Normalize decoder (no centering needed with SVD)
+        decoder_norm = np.linalg.norm(decoder_vec)
+        if decoder_norm == 0:
             continue
-        scaled = direction * (target_length / length)
-        end_point = baseline_3d + scaled
+        decoder_normalized = decoder_vec / decoder_norm
+
+        # Project decoder onto SVD basis
+        projection_3d = pca_basis_3d @ decoder_normalized  # [3]
+
+        # Compute projection magnitude (fraction of vector in subspace)
+        projection_magnitude = np.linalg.norm(projection_3d)
+
+        # Scale for visualization
+        scaled = projection_3d * target_length
+
+        # Draw line from origin
+        origin = np.zeros(3)
         fig.add_trace(
             go.Scatter3d(
-                x=[float(baseline_3d[0]), float(end_point[0])],
-                y=[float(baseline_3d[1]), float(end_point[1])],
-                z=[float(baseline_3d[2]), float(end_point[2])],
-                mode="lines",
-                line=dict(color="black", width=2),
-                name=f"Feature {fid}",
-                hovertemplate=f"Feature {fid}<extra></extra>",
+                x=[0, float(scaled[0])],
+                y=[0, float(scaled[1])],
+                z=[0, float(scaled[2])],
+                mode="lines+text",
+                line=dict(color="red", width=4),
+                text=["", f"{fid}<br>({projection_magnitude:.2f})"],
+                textposition="top center",
+                textfont=dict(size=10, color="black"),
+                name=f"Feat {fid}",
+                hovertemplate=f"Feature {fid}<br>Projection: {projection_magnitude:.3f}<extra></extra>",
                 showlegend=False,
             )
         )
+
     fig.update_layout(
         scene=dict(
-            xaxis=dict(title=pc_labels[0], showticklabels=False, zeroline=False),
-            yaxis=dict(title=pc_labels[1], showticklabels=False, zeroline=False),
-            zaxis=dict(title=pc_labels[2], showticklabels=False, zeroline=False),
+            xaxis=dict(title=pc_labels[0], showticklabels=False, zeroline=True),
+            yaxis=dict(title=pc_labels[1], showticklabels=False, zeroline=True),
+            zaxis=dict(title=pc_labels[2], showticklabels=False, zeroline=True),
             bgcolor="rgba(0,0,0,0)",
             aspectmode="cube",
         ),
@@ -412,7 +652,12 @@ def _make_figure_spec(entry: PCAResult, pc_x: int = 0, pc_y: int = 1, pc_z: int 
     return spec
 
 
-def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
+def write_dashboard(
+    results: List[PCAResult],
+    output_path: Path,
+    highlight_substring: str | None = None,
+) -> None:
+    """Generate HTML dashboard with interactive 3D SVD plots."""
     # Generate multiple figure specs per component (one per PC triplet)
     all_figure_specs = []
     components_payload = []
@@ -435,6 +680,8 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
             "count_hist": entry.count_hist,
             "n_pcs": entry.n_pcs,
             "pc_triplets": triplets,
+            "highlight_count": int(sum(1 for flag in entry.highlight_mask if flag)),
+            "highlight_total": len(entry.highlight_mask),
         })
 
     # Serialize figure specs as nested arrays
@@ -473,15 +720,19 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
     figures_json_safe = figures_json.replace("</", "<\\/")
 
     meta_note = (
-        "Colors: red = 1 feature active, orange = 2 features, blue = 3+ features."
+        "SVD basis computed from SAE decoder directions (no centering). Origin = b_dec (SAE baseline). "
+        "Highlighted tokens are tinted orange when a substring filter is provided. "
+        "Red lines = decoder directions with projection magnitudes."
     )
+    if highlight_substring:
+        meta_note += f" Highlighting tokens containing \"{highlight_substring}\"."
 
     html_content = f"""<!DOCTYPE html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\" />
-  <title>3D PCA Component Dashboard</title>
-  <script src=\"https://cdn.plot.ly/plotly-3.1.0.min.js\"></script>
+  <meta charset="utf-8" />
+  <title>SAE Feature Subspace SVD Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-3.1.0.min.js"></script>
   <style>
     body {{ font-family: sans-serif; margin: 0; padding: 1.5rem; background: #f6f6f6; }}
     h1 {{ margin-top: 0; font-size: 1.4rem; }}
@@ -502,15 +753,15 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
   </style>
 </head>
 <body>
-  <h1>3D PCA of multi-feature components</h1>
-  <div class=\"meta\">Showing {PAGE_SIZE} plots per page (4 × 2 grid). Total components: {len(results)}. Use the arrows or ←/→ keys to switch pages. {meta_note}</div>
-  <div class=\"nav\">
-    <button id=\"prev-page\">◀ Prev</button>
-    <span id=\"page-indicator\"></span>
-    <button id=\"next-page\">Next ▶</button>
-    <button id=\"unload-page\">Unload this page</button>
+  <h1>SAE Feature Subspace: SVD of Decoder Directions</h1>
+  <div class="meta">Showing {PAGE_SIZE} plots per page (4 × 2 grid). Total components: {len(results)}. Use the arrows or ←/→ keys to switch pages. {meta_note}</div>
+  <div class="nav">
+    <button id="prev-page">◀ Prev</button>
+    <span id="page-indicator"></span>
+    <button id="next-page">Next ▶</button>
+    <button id="unload-page">Unload this page</button>
   </div>
-  <div class=\"grid\">
+  <div class="grid">
 {cells_html}
   </div>
   <script>
@@ -519,10 +770,10 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
     const PAGE_SIZE = {PAGE_SIZE};
     const TOTAL_COMPONENTS = COMPONENTS.length;
     const TOTAL_PAGES = Math.max(1, Math.ceil(TOTAL_COMPONENTS / PAGE_SIZE));
-    const FEATURE_BASE_URL = \"{FEATURE_BASE_URL}\";
+    const FEATURE_BASE_URL = "{FEATURE_BASE_URL}";
 
     const assignments = new Array(PAGE_SIZE).fill(null);
-    const tripletIndices = new Array(PAGE_SIZE).fill(0);  // Track which PC triplet is shown per cell
+    const tripletIndices = new Array(PAGE_SIZE).fill(0);
     let currentPage = 0;
 
     function plotId(cell) {{ return 'plot-' + String(cell); }}
@@ -561,14 +812,16 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
     function formatComponent(metadata) {{
       const features = metadata.feature_ids.join(', ');
       const variance = metadata.variance.map(function(v) {{ return v.toFixed(2); }}).join(', ');
-      const counts = formatCounts(metadata.count_hist || []);
-      return [
+      const lines = [
         'Comp ' + metadata.component_index,
         'Tokens: ' + metadata.token_count,
         'Features (' + metadata.feature_ids.length + '): ' + features,
         'Variance: ' + variance,
-        'Counts (1/2/3+): ' + counts,
-      ].join('<br>');
+      ];
+      if (metadata.highlight_count && metadata.highlight_total) {{
+        lines.push('Highlights: ' + metadata.highlight_count + ' / ' + metadata.highlight_total);
+      }}
+      return lines.join('<br>');
     }}
 
     function updateNav() {{
@@ -613,7 +866,7 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
 
     function assignCell(cell, globalIndex) {{
       assignments[cell] = globalIndex;
-      tripletIndices[cell] = 0;  // Reset to first triplet
+      tripletIndices[cell] = 0;
       const info = document.getElementById(infoId(cell));
       const buttons = document.querySelectorAll('.feature-button[data-cell="' + cell + '"]');
       const nav = document.getElementById(pcNavId(cell));
@@ -706,7 +959,6 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
         }});
       }});
 
-      // PC triplet navigation
       document.querySelectorAll('.triplet-prev').forEach(function(btn) {{
         btn.addEventListener('click', function() {{
           const cell = parseInt(btn.dataset.cell, 10);
@@ -762,12 +1014,14 @@ def write_dashboard(results: List[PCAResult], output_path: Path) -> None:
 
 
 def main() -> None:
+    load_dotenv()
     args = parse_args()
     run_dir = args.run_dir
     metadata_dir = run_dir / "metadata"
     coactivations_path = metadata_dir / "coactivations.parquet"
     feature_counts_path = metadata_dir / "feature_counts_trimmed.parquet"
 
+    # Compute components
     config = ComponentGraphConfig(
         coactivations_path=coactivations_path,
         feature_counts_path=feature_counts_path,
@@ -778,9 +1032,9 @@ def main() -> None:
         or ComponentGraphConfig.__dataclass_fields__["sae_release"].default,
         sae_name=args.sae_name
         or ComponentGraphConfig.__dataclass_fields__["sae_name"].default,
-        device=args.device,
+        device="cpu",  # Just for decoder loading
         density_threshold=args.density_threshold,
-        batch_size=args.batch_size,
+        batch_size=1_000_000,
     )
 
     result = compute_components(config)
@@ -799,35 +1053,91 @@ def main() -> None:
             print("No components with the requested feature count were found")
         return
 
+    # Load decoder directions - need FULL SAE feature count, not just max in components
+    full_counts_path = metadata_dir / "feature_counts.parquet"
+    if not full_counts_path.exists():
+        raise FileNotFoundError(
+            f"Missing feature_counts.parquet at {full_counts_path}. "
+            "This file is needed to determine the SAE's total feature count."
+        )
+    full_counts_table = pq.read_table(full_counts_path)
+    total_features = full_counts_table.num_rows
+
+    decoder_directions = _resolve_decoder_vectors(
+        feature_count=total_features,
+        config=config,
+        metadata_dir=metadata_dir,
+    )
+
+    # Load SAE to get b_dec (decoder bias, defines SAE's natural origin)
+    print("Loading SAE to extract b_dec...")
+    from coactivation_manifolds.sae_loader import load_sae
+    sae_handle = load_sae(
+        sae_release=config.sae_release,
+        sae_name=config.sae_name,
+        device="cpu"
+    )
+    b_dec = sae_handle.sae.b_dec.detach().cpu().numpy().astype(np.float32)  # [d_model]
+
     metadata_first = result.first_token_idx
     metadata_last = result.last_token_idx if result.last_token_idx >= 0 else None
     resolved_first = args.first_token_idx if args.first_token_idx is not None else metadata_first
     resolved_last = args.last_token_idx if args.last_token_idx is not None else metadata_last
 
-    matrices, snippet_lists = collect_component_matrices(
+    # Collect token metadata
+    print("Collecting token metadata...")
+    tokens_per_component, snippets_per_component, highlight_masks = collect_token_metadata(
         run_dir,
         components,
         first_token_idx=resolved_first,
         last_token_idx=resolved_last,
+        max_tokens_per_component=args.max_tokens_per_component,
         show_progress=not args.no_progress,
     )
 
+    # Load dataset
+    print(f"Loading dataset {args.dataset}...")
+    dataset = load_dataset(
+        args.dataset,
+        args.dataset_config,
+        split=args.dataset_split,
+        streaming=args.stream_dataset,
+    )
+
+    # Collect transformer hidden states
+    matrices = collect_transformer_states(
+        tokens_per_component,
+        components,
+        dataset=dataset,
+        text_field=args.text_field,
+        model_name=args.model_name,
+        layer_index=args.layer_index,
+        device=args.device,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        show_progress=not args.no_progress,
+    )
+
+    # Generate PCA results
     results = generate_pca_results(
         components,
         matrices,
-        snippet_lists,
+        snippets_per_component,
+        tokens_per_component,
+        highlight_masks,
+        decoder_directions,
+        b_dec,
         min_activations=args.min_activations,
-        max_pcs=args.max_pcs,
         show_progress=not args.no_progress,
     )
 
     if not results:
-        print("No components had sufficient activations for PCA")
+        print("No components had sufficient activations for SVD")
         return
 
-    output_dir = args.output_dir or (metadata_dir / "component_pca_3d")
+    output_dir = args.output_dir or (metadata_dir / "transformer_pca_3d")
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "component_pca_3d_dashboard.html"
+    output_path = output_dir / "transformer_pca_dashboard.html"
     write_dashboard(results, output_path)
 
 
