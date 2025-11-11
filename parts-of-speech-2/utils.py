@@ -20,8 +20,30 @@ TAG_NAMES = [
     'ADV',
     'INTJ',
     'VERB',
-    'AUX'
+    'AUX',
 ]
+    
+"""
+Label counts:
+_: 14950
+DET: 16278
+ADJ: 13218
+NOUN: 38085
+VERB: 23718
+SCONJ: 4513
+PRON: 18629
+ADV: 10095
+ADP: 17653
+PROPN: 16756
+NUM: 12275
+PUNCT: 22879
+AUX: 13246
+PART: 6601
+CCONJ: 6706
+INTJ: 724
+X: 4973
+SYM: 724
+"""
 
 def tokenize_with_labels(text: str, ud_tokens: List[str], ud_labels: List[int], ud_heads: List[str], tokenizer: AutoTokenizer) -> tuple[any, List[int]]:
     ud_filter_mask = [ud_head != "None" for ud_head in ud_heads]

@@ -5,10 +5,12 @@ import joblib
 
 from utils import tag_name_to_upos
 
-TRAIN_PATH = "activations_test.npz"
+# TRAIN_PATH = "activations_train.npz"
+TRAIN_PATH = "activations_train.npz"
 VAL_PATH = "activations_validation.npz"
 MODEL_PATH = "probe.joblib"
 EXCLUDED_LABELS = ["_", "SYM", "INTJ"]  # e.g., ["_", "NOUN", "X"]
+# EXCLUDED_LABELS = []
 C = 1.0
 MAX_ITER = 500
 
