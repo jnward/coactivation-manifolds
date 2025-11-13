@@ -25,6 +25,33 @@ DTYPE_MAP = {
 }
 
 
+def compute_normalization_stats(
+    feats: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = feats.mean(dim=0)
+    std = feats.std(dim=0, unbiased=False).clamp(min=eps)
+    return mean, std
+
+
+def apply_normalization_tensor(
+    feats: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    mean = mean.to(feats.device, dtype=feats.dtype)
+    std = std.to(feats.device, dtype=feats.dtype)
+    return (feats - mean) / std
+
+
+def apply_normalization_numpy(
+    feats: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+) -> np.ndarray:
+    return (feats - mean) / std
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a linear POS probe for Gemma-2-2b.")
     parser.add_argument("--model-name", default=constants.DEFAULT_MODEL_NAME, help="HF model identifier.")
@@ -41,6 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sklearn-max-iter", type=int, default=200, help="Max iterations for sklearn logistic regression.")
     parser.add_argument("--sklearn-C", type=float, default=1.0, help="Inverse L2 regularization strength for sklearn logistic regression.")
     parser.add_argument("--sklearn-class-weight", choices=["none", "balanced"], default="balanced", help="Class weighting scheme for sklearn logistic regression.")
+    parser.add_argument("--normalize-activations", action="store_true", help="Standardize activations (train split stats) before fitting.")
+    parser.add_argument("--normalization-eps", type=float, default=1e-6, help="Minimum std when normalizing.")
     parser.add_argument("--disabled-tags", type=str, default="", help="Comma-separated POS tags to drop from training/evaluation (e.g., INTJ).")
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--val-split", default="validation")
@@ -106,18 +135,25 @@ def build_feature_loader(
     batch_size: int,
     shuffle: bool,
     mapping: np.ndarray | None = None,
+    normalization: dict | None = None,
 ) -> DataLoader:
     feats, labels = activations.load_activation_cache(path)
     if mapping is not None:
         feats, labels = _filter_features_labels(feats, labels, mapping)
     else:
         labels = labels.long()
+    if normalization is not None:
+        feats = apply_normalization_tensor(feats, normalization["mean_t"], normalization["std_t"])
     dataset = TensorDataset(feats, labels)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=False)
     return loader
 
 
-def load_filtered_numpy(path: Path, mapping: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+def load_filtered_numpy(
+    path: Path,
+    mapping: np.ndarray | None,
+    normalization: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     feats, labels = activations.load_activation_cache(path)
     feats_np = feats.numpy().astype(np.float32)
     labels_np = labels.numpy()
@@ -126,6 +162,10 @@ def load_filtered_numpy(path: Path, mapping: np.ndarray | None) -> tuple[np.ndar
         keep = mapped >= 0
         feats_np = feats_np[keep]
         labels_np = mapped[keep]
+    if normalization is not None:
+        feats_np = apply_normalization_numpy(
+            feats_np, normalization["mean_np"], normalization["std_np"]
+        )
     return feats_np, labels_np
 
 
@@ -220,14 +260,39 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    normalization = None
+    if args.normalize_activations:
+        feats_for_stats, _ = activations.load_activation_cache(cache_files[args.train_split])
+        norm_mean = feats_for_stats.mean(dim=0)
+        norm_std = feats_for_stats.std(dim=0, unbiased=False).clamp(min=args.normalization_eps)
+        normalization = {
+            "mean_t": norm_mean,
+            "std_t": norm_std,
+            "mean_np": norm_mean.numpy().astype(np.float32),
+            "std_np": norm_std.numpy().astype(np.float32),
+        }
+        del feats_for_stats
+
     train_loader_feats = build_feature_loader(
-        cache_files[args.train_split], args.probe_batch_size, shuffle=True, mapping=label_mapping
+        cache_files[args.train_split],
+        args.probe_batch_size,
+        shuffle=True,
+        mapping=label_mapping,
+        normalization=normalization,
     )
     val_loader_feats = build_feature_loader(
-        cache_files[args.val_split], args.probe_batch_size, shuffle=False, mapping=label_mapping
+        cache_files[args.val_split],
+        args.probe_batch_size,
+        shuffle=False,
+        mapping=label_mapping,
+        normalization=normalization,
     )
     test_loader_feats = build_feature_loader(
-        cache_files[args.test_split], args.probe_batch_size, shuffle=False, mapping=label_mapping
+        cache_files[args.test_split],
+        args.probe_batch_size,
+        shuffle=False,
+        mapping=label_mapping,
+        normalization=normalization,
     )
 
     probe_model = probe.LinearProbe(model_hidden_size, num_labels=len(active_tags))
@@ -244,7 +309,7 @@ def main() -> None:
         )
     else:
         train_feats_np, train_labels_np = load_filtered_numpy(
-            cache_files[args.train_split], label_mapping
+            cache_files[args.train_split], label_mapping, normalization
         )
         class_weight = None if args.sklearn_class_weight == "none" else "balanced"
 
@@ -360,6 +425,9 @@ def main() -> None:
         activation_cache_dir=args.activation_cache_dir,
     )
 
+    if normalization is not None:
+        probe.bake_input_normalization(probe_model, normalization["mean_t"], normalization["std_t"])
+
     probe.save_probe(
         probe_model,
         weights_path,
@@ -374,6 +442,13 @@ def main() -> None:
                 "class_weight": args.sklearn_class_weight,
             }
             if args.trainer == "sklearn"
+            else None,
+            "normalization": {
+                "mean": normalization["mean_np"].tolist(),
+                "std": normalization["std_np"].tolist(),
+                "eps": args.normalization_eps,
+            }
+            if normalization is not None
             else None,
         },
     )

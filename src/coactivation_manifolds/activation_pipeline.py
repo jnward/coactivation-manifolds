@@ -85,8 +85,12 @@ class ActivationPipeline:
                 max_length=self.config.max_length,
             )
 
-            # Only manually move to device if not using device_map
-            if not self.use_device_map:
+            # Move inputs to appropriate device
+            if self.use_device_map:
+                # When using device_map, move to first layer's device (embedding layer)
+                first_device = next(self.model.parameters()).device
+                tokenized = {k: v.to(first_device) for k, v in tokenized.items()}
+            else:
                 tokenized = {k: v.to(self.device) for k, v in tokenized.items()}
 
             with torch.no_grad():
@@ -156,6 +160,16 @@ class ActivationPipeline:
         attention_mask = tokenized.get("attention_mask")
         mask_cpu = attention_mask.detach().cpu() if attention_mask is not None else None
 
+        # Build token decode cache using batch_decode to reduce CPU overhead
+        unique_ids = torch.unique(input_ids)
+        unique_ids_list = unique_ids.tolist()
+        decoded_tokens = self.tokenizer.batch_decode(
+            [[tid] for tid in unique_ids_list],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False
+        )
+        token_cache = dict(zip(unique_ids_list, decoded_tokens))
+
         records: List[ActivationRecord] = []
         stop = False
 
@@ -163,6 +177,7 @@ class ActivationPipeline:
             doc_id = doc_ids[batch_idx]
             seq_ids = input_ids[batch_idx]
             seq_acts = sae_cpu[batch_idx]
+            seq_acts_np = seq_acts.numpy()  # Convert to numpy once per sequence
             seq_len = int(seq_ids.shape[0])
             mask = mask_cpu[batch_idx] if mask_cpu is not None else torch.ones(seq_len, dtype=torch.long)
 
@@ -174,20 +189,18 @@ class ActivationPipeline:
                 if mask[token_pos] == 0:
                     continue
 
-                feature_vector = seq_acts[token_pos]
-                nz = torch.nonzero(feature_vector, as_tuple=False).squeeze(-1)
+                # Use numpy for faster nonzero operations on CPU
+                feature_vector_np = seq_acts_np[token_pos]
+                nz_np = np.nonzero(feature_vector_np)[0]
 
-                if nz.ndim == 0:
-                    nz = nz.unsqueeze(0)
-                if nz.numel() == 0:
+                if nz_np.size == 0:
                     feature_ids = []
                     activations = []
                 else:
-                    nz_np = nz.numpy().astype("uint16")
-                    feature_ids = nz_np.tolist()
-                    activations = feature_vector[nz].numpy().astype("float16").tolist()
+                    feature_ids = nz_np.astype("uint16").tolist()
+                    activations = feature_vector_np[nz_np].astype("float16").tolist()
 
-                snippet = self._make_snippet(seq_ids.numpy(), token_pos)
+                snippet = self._make_snippet(seq_ids.numpy(), token_pos, token_cache)
 
                 record = ActivationRecord(
                     doc_id=doc_id,
@@ -226,20 +239,19 @@ class ActivationPipeline:
 
         return torch.float32
 
-    def _make_snippet(self, seq_ids: np.ndarray, token_pos: int, window: int = 10) -> str:
+    def _make_snippet(self, seq_ids: np.ndarray, token_pos: int, token_cache: dict, window: int = 10) -> str:
         seq_len = int(seq_ids.shape[0])
         left_start = max(token_pos - window, 0)
         right_end = min(token_pos + window + 1, seq_len)
 
-        left_ids = seq_ids[left_start:token_pos]
-        center_ids = seq_ids[token_pos : token_pos + 1]
-        right_ids = seq_ids[token_pos + 1 : right_end]
+        # Build snippet from cached decoded tokens (no decode calls!)
+        left_tokens = [token_cache[int(tid)] for tid in seq_ids[left_start:token_pos]]
+        center_token = token_cache[int(seq_ids[token_pos])]
+        right_tokens = [token_cache[int(tid)] for tid in seq_ids[token_pos + 1 : right_end]]
 
-        decode = self.tokenizer.decode
-        left_text = decode(left_ids.tolist(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        center_text = decode(center_ids.tolist(), skip_special_tokens=False, clean_up_tokenization_spaces=False)
-        right_text = decode(right_ids.tolist(), skip_special_tokens=True, clean_up_tokenization_spaces=False)
-
-        snippet = f"{left_text} «{center_text}» {right_text}".strip()
+        # Concatenate with special formatting for center token
+        left_text = ''.join(left_tokens)
+        right_text = ''.join(right_tokens)
+        snippet = f"{left_text} «{center_token}» {right_text}".strip()
         snippet = " ".join(snippet.split())
         return snippet

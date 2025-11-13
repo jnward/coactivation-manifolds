@@ -170,6 +170,24 @@ def confusion_matrix_counts(
     return matrix
 
 
+def bake_input_normalization(
+    probe: LinearProbe,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> None:
+    """Fold (x-mean)/std normalization into the probe weights."""
+
+    if mean is None or std is None:
+        return
+    mean = mean.to(probe.linear.weight.device, dtype=probe.linear.weight.dtype)
+    std = std.to(probe.linear.weight.device, dtype=probe.linear.weight.dtype)
+    with torch.no_grad():
+        weight = probe.linear.weight
+        bias = probe.linear.bias
+        weight.div_(std)
+        bias.sub_((weight * mean).sum(dim=1))
+
+
 def train_probe(
     probe: LinearProbe,
     train_loader: DataLoader,

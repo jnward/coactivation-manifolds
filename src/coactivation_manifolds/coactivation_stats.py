@@ -64,6 +64,21 @@ def _process_shard_batch(
     return feature_counts, dict(pair_counts), token_count
 
 
+def _process_shard_batch_with_len(
+    args: Tuple[int, List[Path], int, int, int]
+) -> Tuple[int, np.ndarray, Dict[Tuple[int, int], int], int]:
+    """Wrapper to retain shard counts for progress reporting."""
+
+    batch_len, shard_paths, num_features, first_token_idx, last_token_idx = args
+    feature_counts, pair_counts, token_count = _process_shard_batch(
+        shard_paths,
+        num_features,
+        first_token_idx,
+        last_token_idx,
+    )
+    return batch_len, feature_counts, pair_counts, token_count
+
+
 def _merge_results(
     results: List[Tuple[np.ndarray, Dict[Tuple[int, int], int], int]]
 ) -> Tuple[np.ndarray, Dict[Tuple[int, int], int], int]:
@@ -159,12 +174,22 @@ def compute_coactivation_counts(
 
         # Process batches in parallel
         print(f"Processing {len(shard_paths)} shards with {num_workers} workers...")
-        with Pool(processes=num_workers) as pool:
-            tasks = [
-                (batch, num_features, first_token_idx, last_token_idx)
-                for batch in worker_batches if batch
-            ]
-            results = pool.starmap(_process_shard_batch, tasks)
+        tasks = [
+            (len(batch), batch, num_features, first_token_idx, last_token_idx)
+            for batch in worker_batches
+            if batch
+        ]
+
+        print(f"Processing {len(shard_paths)} shards with {num_workers} workers...")
+        with Pool(processes=num_workers) as pool, tqdm(
+            total=len(shard_paths), desc="Shards", leave=False
+        ) as progress:
+            results = []
+            for batch_len, feature_counts_part, pair_counts_part, token_count_part in pool.imap_unordered(
+                _process_shard_batch_with_len, tasks
+            ):
+                progress.update(batch_len)
+                results.append((feature_counts_part, pair_counts_part, token_count_part))
 
         # Merge results
         print("Merging results...")

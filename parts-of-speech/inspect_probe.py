@@ -94,23 +94,53 @@ def main() -> None:
             )
         hidden = outputs.hidden_states[args.layer_index + 1][0]
         mask = batch["label_mask"][0].bool()
-        words = batch["tokens"][0]
-        gold_word_tags = batch["upos"][0]
+        subtoken_texts = tokenizer.convert_ids_to_tokens(
+            batch["input_ids"][0].tolist(), skip_special_tokens=False
+        )
+        text = batch["text"][0]
+        words_raw = batch["tokens"][0]
+        upos_raw = batch["upos"][0]
+        heads = batch["heads"][0]
+        normalized_tags = [
+            tag_lookup.get(int(tag), str(tag)) if isinstance(tag, (int, float)) else tag
+            for tag in upos_raw
+        ]
+        filtered_words, filtered_tags = data.filter_tokens_by_head(
+            words_raw,
+            normalized_tags,
+            heads,
+        )
+        char_map = data.build_char_map(text, filtered_words)
+        encoding = tokenizer(
+            text,
+            return_offsets_mapping=True,
+            truncation=True,
+            max_length=args.max_length,
+            padding=False,
+        )
+        offsets = encoding["offset_mapping"]
+        subtoken_word_idx = []
+        for start, end in offsets:
+            if start == end or not char_map:
+                subtoken_word_idx.append(None)
+                continue
+            char_idx = min(end - 1, len(char_map) - 1)
+            word_index = char_map[char_idx]
+            subtoken_word_idx.append(word_index if word_index >= 0 else None)
 
         vecs = hidden[mask].to(args.device, dtype=torch.float32)
         logits = probe_model(vecs)
 
-        sentence_text = " ".join(words)
-        print(f"\nSentence {shown + 1}: {sentence_text}")
+        print(f"\nSentence {shown + 1}: {text}")
 
-        word_pairs = list(zip(words, gold_word_tags))
-        max_pairs = min(len(word_pairs), logits.shape[0])
-        truncated = len(word_pairs) - max_pairs
+        mask_positions = mask.nonzero(as_tuple=False).squeeze(-1).tolist()
 
-        for vec_idx in range(max_pairs):
-            word, gold_tag = word_pairs[vec_idx]
-            gold_tag = tag_lookup.get(int(gold_tag), str(gold_tag))
-            gold_tag = gold_tag.strip().upper()
+        for vec_idx, sub_pos in enumerate(mask_positions):
+            word_index = subtoken_word_idx[sub_pos] if sub_pos < len(subtoken_word_idx) else None
+            if word_index is None or word_index >= len(filtered_words):
+                continue
+            word = subtoken_texts[sub_pos]
+            gold_tag = filtered_tags[word_index].strip().upper()
             if gold_tag not in tag_to_idx:
                 print(f"{word:<15} gold={gold_tag:<6} | tag not in probe head (skipped)")
                 continue
@@ -140,9 +170,6 @@ def main() -> None:
                 marker = "✓" if pred_tag == gold_tag else "✗"
                 print(f" | {mode}: {pred_tag} ({pred_prob:.2f}) {marker}", end="")
             print()
-
-        if truncated > 0:
-            print(f"... {truncated} trailing word(s) truncated by tokenizer.")
 
         shown += 1
 

@@ -46,7 +46,8 @@ poetry run python parts-of-speech/train_probe.py \
   --layer-index 12 \
   --extract-batch-size 8 \
   --probe-batch-size 1024 \
-  --epochs 5
+  --epochs 5 \
+  --normalize-activations
 ```
 
 This command:

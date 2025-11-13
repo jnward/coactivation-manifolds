@@ -6,6 +6,7 @@ src/coactivation_manifolds/activation_reader.py
 src/coactivation_manifolds/activation_writer.py
 src/coactivation_manifolds/coactivation_stats.py
 src/coactivation_manifolds/component_graph.py
+src/coactivation_manifolds/default_config.py
 src/coactivation_manifolds/sae_loader.py
 src/coactivation_manifolds.egg-info/PKG-INFO
 src/coactivation_manifolds.egg-info/SOURCES.txt

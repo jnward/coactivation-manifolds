@@ -65,58 +65,13 @@ def tokenize_and_align(
 ) -> DatasetDict:
     """Tokenize sentences and align POS tags to final subtokens."""
 
-    keep_columns = {"tokens", "upos", "text"}
-    remove_columns = [
-        col for col in dataset["train"].column_names if col not in keep_columns
-    ]
-
-    def _batch_tokenize(batch: Dict[str, List[Sequence[str]]]) -> Dict[str, List]:
-        encodings = tokenizer(
-            batch["tokens"],
-            is_split_into_words=True,
-            padding=False,
-            truncation=True,
-            max_length=max_length,
-            return_attention_mask=True,
-        )
-
-        batch_input_ids = encodings["input_ids"]
-        batch_attention = encodings["attention_mask"]
-
-        batch_labels: List[List[int]] = []
-        batch_label_mask: List[List[int]] = []
-
-        for i in range(len(batch_input_ids)):
-            word_ids = encodings.word_ids(i)
-            upos_tags = _normalize_tag_sequence(batch["upos"][i], tag_names)
-
-            seq_len = len(batch_input_ids[i])
-            labels = [-100] * seq_len
-            mask = [0] * seq_len
-
-            for token_idx, word_idx in enumerate(word_ids):
-                if word_idx is None:
-                    continue
-                is_last = token_idx == seq_len - 1 or word_ids[token_idx + 1] != word_idx
-                if not is_last:
-                    continue
-                tag = map_tag(upos_tags[word_idx])
-                labels[token_idx] = TAG_TO_ID[tag]
-                mask[token_idx] = 1
-
-            batch_labels.append(labels)
-            batch_label_mask.append(mask)
-
-        return {
-            "input_ids": batch_input_ids,
-            "attention_mask": batch_attention,
-            "labels": batch_labels,
-            "label_mask": batch_label_mask,
-        }
+    remove_columns = dataset["train"].column_names
 
     tokenized = dataset.map(
-        _batch_tokenize,
-        batched=True,
+        lambda ex: align_example(
+            ex, tokenizer, tag_names, max_length
+        ),
+        batched=False,
         remove_columns=remove_columns,
         num_proc=num_proc,
         desc="Tokenizing + aligning UD POS tags",
@@ -152,7 +107,101 @@ class POSDataCollator:
 
         batch["labels"] = labels
         batch["label_mask"] = mask
-        batch["tokens"] = [f["tokens"] for f in features]
-        batch["upos"] = [f["upos"] for f in features]
-        batch["text"] = [f.get("text", "") for f in features]
+
+        extra_keys = set(features[0].keys()) - {
+            "input_ids",
+            "attention_mask",
+            "labels",
+            "label_mask",
+        }
+        for key in extra_keys:
+            batch[key] = [f[key] for f in features]
         return batch
+
+
+def filter_tokens_by_head(
+    tokens: Sequence[str],
+    upos_tags: Sequence[str],
+    heads: Sequence,
+) -> tuple[list[str], list[str]]:
+    filtered_tokens: list[str] = []
+    filtered_tags: list[str] = []
+    for token, tag, head in zip(tokens, upos_tags, heads):
+        if head == "None":
+            continue
+        filtered_tokens.append(token)
+        filtered_tags.append(tag)
+    return filtered_tokens, filtered_tags
+
+
+def build_char_map(text: str, tokens: Sequence[str]) -> list[int]:
+    char_to_word = [-1] * len(text)
+    text_pos = 0
+    word_idx = 0
+    char_in_word = 0
+    while text_pos < len(text) and word_idx < len(tokens):
+        current = tokens[word_idx]
+        if char_in_word >= len(current):
+            word_idx += 1
+            char_in_word = 0
+            continue
+        if text[text_pos] == current[char_in_word]:
+            char_to_word[text_pos] = word_idx
+            char_in_word += 1
+            text_pos += 1
+        else:
+            text_pos += 1
+    return char_to_word
+
+
+def align_example(
+    example: Dict[str, Sequence],
+    tokenizer: PreTrainedTokenizerBase,
+    tag_names: Sequence[str],
+    max_length: int,
+) -> Dict[str, Sequence]:
+    text: str = example["text"]
+    tokens_raw: Sequence[str] = example["tokens"]
+    upos_raw = _normalize_tag_sequence(example["upos"], tag_names)
+    heads = example.get("head") or example.get("heads") or ["0"] * len(tokens_raw)
+
+    tokens, upos_tags = filter_tokens_by_head(tokens_raw, upos_raw, heads)
+
+    encoding = tokenizer(
+        text,
+        return_offsets_mapping=True,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+    )
+
+    input_ids = encoding["input_ids"]
+    attention = encoding["attention_mask"]
+    offsets = encoding["offset_mapping"]
+
+    labels = [-100] * len(input_ids)
+    mask = [0] * len(input_ids)
+
+    if tokens:
+        char_map = build_char_map(text, tokens)
+        for idx, (start, end) in enumerate(offsets):
+            if start == end:
+                continue
+            char_idx = min(end - 1, len(char_map) - 1) if len(char_map) > 0 else -1
+            token_idx = char_map[char_idx] if char_idx >= 0 else -1
+            if token_idx == -1:
+                continue
+            tag = map_tag(upos_tags[token_idx])
+            labels[idx] = TAG_TO_ID[tag]
+            mask[idx] = 1
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention,
+        "labels": labels,
+        "label_mask": mask,
+        "tokens": list(tokens_raw),
+        "upos": list(upos_raw),
+        "heads": list(heads),
+        "text": text,
+    }
