@@ -11,7 +11,7 @@ PROBE_PATH = "probe.joblib"
 MODEL_NAME = "google/gemma-2-2b"
 LAYER_OF_INTEREST = 12
 SPLIT = "test"
-NUM_SENTENCES = 24
+NUM_SENTENCES = 64
 SEED = 0
 
 
@@ -78,7 +78,7 @@ def main():
             correct = true_label == pred_label
             status = "✓" if correct else "✗"
             print(f"  {token}: true={true_name}, pred={pred_name} {status}")
-            if not correct:
+            if not correct or True:
                 top_guesses = format_top_k(prob_vec, classes)
                 guesses_str = ", ".join(f"{name}:{p:.2f}" for name, p in top_guesses)
                 print(f"    Top guesses: {guesses_str}")

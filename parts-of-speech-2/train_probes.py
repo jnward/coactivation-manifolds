@@ -6,9 +6,9 @@ import joblib
 from utils import tag_name_to_upos
 
 # TRAIN_PATH = "activations_train.npz"
-TRAIN_PATH = "activations_train.npz"
-VAL_PATH = "activations_validation.npz"
-MODEL_PATH = "probe.joblib"
+TRAIN_PATH = "activations_test_12.npz"
+VAL_PATH = "activations_validation_12.npz"
+MODEL_PATH = "probe_test.joblib"
 EXCLUDED_LABELS = ["_", "SYM", "INTJ"]  # e.g., ["_", "NOUN", "X"]
 # EXCLUDED_LABELS = []
 C = 1.0

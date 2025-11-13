@@ -8,13 +8,13 @@ from collections import Counter
 from utils import tokenize_with_labels, upos_to_tag_name
 
 MODEL_NAME = "google/gemma-2-2b"
-LAYER_OF_INTEREST = 12
+LAYER = 8
 SPLIT = "train"
 SHUFFLE = True
 SEED = 42
 MAX_SAMPLES = float("inf")
 # MAX_SAMPLES = 256
-OUTPUT_PATH = f"activations_{SPLIT}.npz"
+OUTPUT_PATH = f"activations_{SPLIT}_{LAYER}.npz"
 
 def main():
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).cuda()
@@ -53,7 +53,7 @@ def main():
         input_ids = torch.tensor([tokenized["input_ids"]]).cuda()
         with torch.no_grad():
             outputs = model(input_ids, output_hidden_states=True)
-        hidden_states = outputs.hidden_states[LAYER_OF_INTEREST].squeeze(0).detach().cpu().float()
+        hidden_states = outputs.hidden_states[LAYER].squeeze(0).detach().cpu().float()
 
         for position_idx, (token_id, label, hidden_state) in enumerate(zip(tokenized["input_ids"], token_labels, hidden_states)):
             token_str = tokenizer.decode([token_id])
@@ -82,7 +82,7 @@ def main():
         X=X,
         y=y,
         positions=pos,
-        layer=LAYER_OF_INTEREST,
+        layer=LAYER,
         model=MODEL_NAME,
     )
 
