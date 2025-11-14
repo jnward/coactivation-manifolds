@@ -6,14 +6,14 @@ import spacy
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-INPUT_PATH = "test_resamples.jsonl"
-OUTPUT_PATH = "output_with_spacy_pos.jsonl"
+INPUT_PATH = "uncertain_train_spacy_resamples.jsonl"
+OUTPUT_PATH = "spacy_train_output_with_spacy_pos.jsonl"
 SPACY_MODEL = "en_core_web_trf"
 TOKENIZER_NAME = "google/gemma-2-2b"
 BATCH_SIZE = 16
 
 # Prefer GPU if available (spaCy silently falls back to CPU).
-spacy.prefer_gpu()
+spacy.require_gpu()
 
 
 def load_spacy_model(model_name: str):

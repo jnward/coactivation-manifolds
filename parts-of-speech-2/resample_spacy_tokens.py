@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 PROBE_PATH = Path("spacy_retagged/spacy_probe.joblib")
 MODEL_NAME = "google/gemma-2-2b"
-SPLIT = "validation"
+SPLIT = "train"
 TARGET_LAYER = 12
 CONF_THRESH = 0.95
 NUM_SAMPLES = 100
@@ -20,10 +20,11 @@ CHUNK_SIZE = 100
 MAX_NEW_TOKENS = 12
 TEMPERATURE = 1.0
 TOP_P = 0.995
-OUTPUT_PATH = Path("uncertain_spacy_resamples.jsonl")
+OUTPUT_PATH = Path("uncertain_train_spacy_resamples.jsonl")
 MAX_PREFIXES = None
 MAX_DATASET_ITEMS = None
 RNG_SEED = 1234
+FILTER_BY_PROBE = False
 
 
 def ensure_pad_token(tokenizer):
@@ -94,7 +95,7 @@ def collect_uncertain_tokens(model, tokenizer, clf, tag_names, records, device) 
             feature = hidden_states[pos].float().unsqueeze(0).numpy()
             probs = clf.predict_proba(feature)[0]
             max_prob = float(probs.max())
-            if max_prob >= CONF_THRESH:
+            if FILTER_BY_PROBE and max_prob >= CONF_THRESH:
                 continue
             pred_idx = int(np.argmax(probs))
             pred_label = int(clf.classes_[pred_idx])
@@ -178,9 +179,15 @@ def main():
 
     candidates = collect_uncertain_tokens(model, tokenizer, clf, tag_names, records, device)
     if not candidates:
-        print("No tokens fell below the confidence threshold; nothing to sample.")
+        if FILTER_BY_PROBE:
+            print("No tokens fell below the confidence threshold; nothing to sample.")
+        else:
+            print("No tokens available to resample.")
         return
-    print(f"Collected {len(candidates)} uncertain prefixes (threshold={CONF_THRESH:.2f}).")
+    if FILTER_BY_PROBE:
+        print(f"Collected {len(candidates)} uncertain prefixes (threshold={CONF_THRESH:.2f}).")
+    else:
+        print(f"Collected {len(candidates)} prefixes (no probe filtering).")
 
     metadata = {
         "model_name": MODEL_NAME,
@@ -188,6 +195,7 @@ def main():
         "split": SPLIT,
         "probe_path": str(PROBE_PATH),
         "confidence_threshold": CONF_THRESH,
+        "filter_by_probe": FILTER_BY_PROBE,
         "num_samples_per_prefix": NUM_SAMPLES,
         "max_new_tokens": MAX_NEW_TOKENS,
         "temperature": TEMPERATURE,
@@ -217,4 +225,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
@@ -13,17 +14,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import jsonlines as jsonlines
 
-INPUT_PATH = "spacy_output_with_spacy_pos.jsonl"
+INPUT_PATH = "spacy_train_output_with_spacy_pos.jsonl"
 MODEL_NAME = "google/gemma-2-2b"
 TARGET_LAYER = 3
-OUTPUT_PATH = Path("spacy_retagged/distilled_probe_old.pt")
-TAG_NAMES_PATH = Path("spacy_retagged/distilled_probe_old_tag_names.json")
+OUTPUT_PATH = Path("spacy_retagged/distilled_probe.pt")
+TAG_NAMES_PATH = Path("spacy_retagged/distilled_probe_tag_names.json")
+HTML_OUTPUT = Path("spacy_retagged/distilled_probe_val_examples.html")
 TRAIN_RATIO = 0.9
 BATCH_SIZE = 64
 EPOCHS = 10
 LR = 1e-3
 MIN_COMPLETIONS = 10
 SEED = 1234
+HTML_SAMPLE_SIZE = 64
 
 
 @dataclass
@@ -69,9 +72,10 @@ def build_distribution(completions: List[dict], tag_to_idx: dict[str, int]) -> n
     return counts
 
 
-def collect_samples(records: List[dict], tag_names: List[str]) -> List[Sample]:
+def collect_samples(records: List[dict], tag_names: List[str]) -> Tuple[List[Sample], List[dict]]:
     tag_to_idx = build_tag_map(tag_names)
     samples: List[Sample] = []
+    infos: List[dict] = []
     for rec in records:
         candidate = rec.get("candidate", {})
         completions = rec.get("completions", [])
@@ -82,7 +86,15 @@ def collect_samples(records: List[dict], tag_names: List[str]) -> List[Sample]:
         if not tokens:
             continue
         samples.append(Sample(tokens=tokens, distribution=dist))
-    return samples
+        infos.append(
+            {
+                "sentence": candidate.get("sentence_text", ""),
+                "prefix": candidate.get("prefix_text", ""),
+                "target": candidate.get("target_token_text", ""),
+                "dataset_idx": candidate.get("dataset_idx", -1),
+            }
+        )
+    return samples, infos
 
 
 def encode_hidden_states(samples: List[Sample]) -> Tuple[np.ndarray, np.ndarray]:
@@ -132,7 +144,7 @@ class DistillationProbe(nn.Module):
         return torch.log_softmax(logits, dim=-1)
 
 
-def train_probe(X: np.ndarray, Y: np.ndarray) -> Tuple[DistillationProbe, float]:
+def train_probe(X: np.ndarray, Y: np.ndarray):
     torch.manual_seed(SEED)
     dataset = TensorDataset(torch.from_numpy(X), torch.from_numpy(Y))
     train_len = int(len(dataset) * TRAIN_RATIO)
@@ -193,18 +205,126 @@ def train_probe(X: np.ndarray, Y: np.ndarray) -> Tuple[DistillationProbe, float]
         )
         best_val = min(best_val, val_mean)
 
-    return model, best_val
+    return model, best_val, train_set, val_set
+
+
+def format_top(dist: np.ndarray, tag_names: List[str], k: int = 5) -> str:
+    idxs = np.argsort(dist)[::-1][:k]
+    return ", ".join(f"{tag_names[i]} ({dist[i]*100:.1f}%)" for i in idxs)
+
+
+def render_examples(
+    model: DistillationProbe,
+    loader: DataLoader,
+    subset_indices: List[int],
+    infos: List[dict],
+    tag_names: List[str],
+    html_path: Path,
+    title: str,
+):
+    if not subset_indices:
+        print(f"No {title} samples to render.")
+        return
+    model.eval()
+    preds = []
+    truths = []
+    with torch.no_grad():
+        for batch_x, batch_y in loader:
+            probs = model(batch_x.cuda()).exp().cpu().numpy()
+            preds.append(probs)
+            truths.append(batch_y.numpy())
+    preds = np.concatenate(preds, axis=0)
+    truths = np.concatenate(truths, axis=0)
+
+    selected_infos = [infos[i] for i in subset_indices]
+    rng = np.random.default_rng(SEED)
+    sample_count = min(len(selected_infos), HTML_SAMPLE_SIZE)
+    select_idx = rng.choice(len(selected_infos), size=sample_count, replace=False)
+
+    rows = []
+    for idx in select_idx:
+        info = selected_infos[idx]
+        pred = preds[idx]
+        truth = truths[idx]
+        rows.append(
+            "<tr>"
+            f"<td>{info.get('dataset_idx', -1)}</td>"
+            f"<td>{html.escape(info.get('target', ''))}</td>"
+            f"<td>{html.escape(format_top(pred, tag_names))}</td>"
+            f"<td>{html.escape(format_top(truth, tag_names))}</td>"
+            f"<td>{html.escape(info.get('prefix', ''))}</td>"
+            f"<td>{html.escape(info.get('sentence', ''))}</td>"
+            "</tr>"
+        )
+
+    html_body = "\n".join(rows)
+    html_doc = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Distilled Probe Samples - {title}</title>
+<style>
+body {{ font-family: sans-serif; margin: 2rem; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #ccc; padding: 0.4rem; text-align: left; }}
+th {{ background: #f0f0f0; }}
+</style>
+</head>
+<body>
+<h1>Random {title} samples ({sample_count})</h1>
+<table>
+<thead>
+<tr>
+<th>Dataset idx</th>
+<th>Target token</th>
+<th>Probe top probs</th>
+<th>Ground truth top probs</th>
+<th>Prefix (incl. target)</th>
+<th>Sentence</th>
+</tr>
+</thead>
+<tbody>
+{html_body}
+</tbody>
+</table>
+</body>
+</html>"""
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.write_text(html_doc, encoding="utf-8")
+    print(f"Wrote {title} sample HTML to {html_path}")
 
 
 def main():
     tag_names, records = load_metadata_and_records(Path(INPUT_PATH))
-    samples = collect_samples(records, tag_names)
+    samples, infos = collect_samples(records, tag_names)
     if not samples:
         raise RuntimeError("No valid samples after filtering.")
     print(f"Collected {len(samples)} samples with >= {MIN_COMPLETIONS} completions.")
 
     X, Y = encode_hidden_states(samples)
-    model, best_val = train_probe(X, Y)
+    model, best_val, train_subset, val_subset = train_probe(X, Y)
+
+    train_loader_vis = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=False)
+    val_loader_vis = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False)
+
+    render_examples(
+        model,
+        train_loader_vis,
+        train_subset.indices,
+        infos,
+        tag_names,
+        HTML_OUTPUT.with_name("distilled_probe_old_train_examples.html"),
+        "training",
+    )
+    render_examples(
+        model,
+        val_loader_vis,
+        val_subset.indices,
+        infos,
+        tag_names,
+        HTML_OUTPUT,
+        "validation",
+    )
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "tag_names": tag_names}, OUTPUT_PATH)
     TAG_NAMES_PATH.write_text(json.dumps(tag_names), encoding="utf-8")

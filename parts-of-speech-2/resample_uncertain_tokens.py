@@ -26,7 +26,7 @@ TOP_P = 0.995
 OUTPUT_PATH = "uncertain_resamples.jsonl"
 EXCLUDED_LABELS = ["_", "SYM", "INTJ"]
 MAX_PREFIXES = None  # optional cap for debugging
-MAX_DATASET_ITEMS = None  # optional cap for scanning phase
+MAX_DATASET_ITEMS = 64  # optional cap for scanning phase
 RNG_SEED = 1234
 
 

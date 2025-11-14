@@ -8,9 +8,9 @@ from collections import Counter
 from utils import tokenize_with_labels, upos_to_tag_name
 
 MODEL_NAME = "google/gemma-2-2b"
-LAYER = 8
+LAYER = 12
 SPLIT = "train"
-SHUFFLE = True
+SHUFFLE = False
 SEED = 42
 MAX_SAMPLES = float("inf")
 # MAX_SAMPLES = 256
