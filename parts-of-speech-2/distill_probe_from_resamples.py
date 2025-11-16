@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import json
 import html
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
+import copy
 
 import numpy as np
 import torch
@@ -14,19 +16,24 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import jsonlines as jsonlines
 
-INPUT_PATH = "spacy_train_output_with_spacy_pos.jsonl"
+INPUT_PATH = "filtered_train_resamples_with_spacy_pos.jsonl"
 MODEL_NAME = "google/gemma-2-2b"
-TARGET_LAYER = 3
-OUTPUT_PATH = Path("spacy_retagged/distilled_probe.pt")
+LAYERS = [2, 4, 6, 8]
+OUTPUT_PATH = Path("spacy_retagged/distilled_probe_layer2-4-6-8-last.pt")
+LINEAR_CONE_OUTPUT_PATH = Path("spacy_retagged/linear_cone_probe_layer2-4-6-8-last.pt")
 TAG_NAMES_PATH = Path("spacy_retagged/distilled_probe_tag_names.json")
 HTML_OUTPUT = Path("spacy_retagged/distilled_probe_val_examples.html")
+LINEAR_CONE_HTML_OUTPUT = Path("spacy_retagged/linear_cone_probe_val_examples.html")
+CACHE_PATH = Path("spacy_retagged/distill_cache.npz")
 TRAIN_RATIO = 0.9
 BATCH_SIZE = 64
-EPOCHS = 10
+EPOCHS = 100
 LR = 1e-3
+WEIGHT_DECAY = 1e-2
 MIN_COMPLETIONS = 10
 SEED = 1234
 HTML_SAMPLE_SIZE = 64
+SAVE_EPOCH = "last"  # "best" or "last"
 
 
 @dataclass
@@ -125,9 +132,14 @@ def encode_hidden_states(samples: List[Sample]) -> Tuple[np.ndarray, np.ndarray]
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-        hidden = outputs.hidden_states[TARGET_LAYER]
+        hidden_states = outputs.hidden_states
+        selected_layers = [hidden_states[layer] for layer in LAYERS]
         for idx, s in enumerate(batch):
-            features.append(hidden[idx, len(s.tokens) - 1].float().cpu().numpy())
+            concat_feat = []
+            pos = len(s.tokens) - 1
+            for layer_tensor in selected_layers:
+                concat_feat.append(layer_tensor[idx, pos].float())
+            features.append(torch.cat(concat_feat, dim=-1).cpu().numpy())
 
     distributions = np.stack([s.distribution for s in samples]).astype(np.float32)
     X = np.stack(features).astype(np.float32)
@@ -144,6 +156,16 @@ class DistillationProbe(nn.Module):
         return torch.log_softmax(logits, dim=-1)
 
 
+class LinearConeProbe(nn.Module):
+    def __init__(self, hidden_dim: int, num_classes: int):
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, num_classes)
+        
+    def forward(self, x):
+        cone_coords = torch.relu(self.linear(x))  # Project to positive cone
+        return cone_coords / (cone_coords.sum(dim=-1, keepdim=True) + 1e-8)
+
+
 def train_probe(X: np.ndarray, Y: np.ndarray):
     torch.manual_seed(SEED)
     dataset = TensorDataset(torch.from_numpy(X), torch.from_numpy(Y))
@@ -153,59 +175,149 @@ def train_probe(X: np.ndarray, Y: np.ndarray):
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
 
-    model = DistillationProbe(X.shape[1], Y.shape[1]).cuda()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # Train softmax probe with KL divergence
+    print("\n=== Training Softmax Probe (KL Divergence) ===")
+    softmax_model = DistillationProbe(X.shape[1], Y.shape[1]).cuda()
+    softmax_optimizer = torch.optim.AdamW(softmax_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     def kl_loss(log_probs, target_probs):
         target_safe = target_probs.clamp(min=1e-8)
         return torch.sum(target_safe * (torch.log(target_safe) - log_probs), dim=-1).mean()
 
-    def r2_score(log_probs, target_probs):
-        probs = log_probs.exp()
+    def l2_loss(probs, target_probs):
+        return ((probs - target_probs) ** 2).sum(dim=-1).mean()
+
+    def r2_score(probs, target_probs):
         numer = torch.sum((target_probs - probs) ** 2)
         denom = torch.sum((target_probs - target_probs.mean(dim=0, keepdim=True)) ** 2)
         if denom == 0:
-            return torch.tensor(0.0, device=log_probs.device)
+            return torch.tensor(0.0, device=probs.device)
         return 1.0 - numer / denom
 
-    best_val = float("inf")
+    def tv_distance(probs, target_probs):
+        return 0.5 * torch.sum(torch.abs(probs - target_probs), dim=-1).mean()
+
+    def tv_distance(probs, target_probs):
+        return 0.5 * torch.sum(torch.abs(probs - target_probs), dim=-1).mean()
+
+    best_softmax_val = float("inf")
+    best_softmax_state = copy.deepcopy(softmax_model.state_dict())
     for epoch in range(EPOCHS):
-        model.train()
+        softmax_model.train()
         train_losses = []
         train_r2_scores = []
+        train_tv_scores = []
         for batch_x, batch_y in train_loader:
             batch_x = batch_x.cuda()
             batch_y = batch_y.cuda()
-            optimizer.zero_grad()
-            log_probs = model(batch_x)
+            softmax_optimizer.zero_grad()
+            log_probs = softmax_model(batch_x)
             loss = kl_loss(log_probs, batch_y)
             loss.backward()
-            optimizer.step()
+            softmax_optimizer.step()
             train_losses.append(loss.item())
-            train_r2_scores.append(r2_score(log_probs.detach(), batch_y).item())
+            probs = log_probs.exp().detach()
+            train_r2_scores.append(r2_score(probs, batch_y).item())
+            train_tv_scores.append(tv_distance(probs, batch_y).item())
 
-        model.eval()
+        softmax_model.eval()
         with torch.no_grad():
             val_losses = []
             val_r2_scores = []
+            val_tv_scores = []
             for batch_x, batch_y in val_loader:
                 batch_x = batch_x.cuda()
                 batch_y = batch_y.cuda()
-                log_probs = model(batch_x)
+                log_probs = softmax_model(batch_x)
+                probs = log_probs.exp()
                 val_losses.append(kl_loss(log_probs, batch_y).item())
-                val_r2_scores.append(r2_score(log_probs, batch_y).item())
+                val_r2_scores.append(r2_score(probs, batch_y).item())
+                val_tv_scores.append(tv_distance(probs, batch_y).item())
         train_mean = float(np.mean(train_losses))
         train_r2 = float(np.mean(train_r2_scores))
+        train_tv = float(np.mean(train_tv_scores))
         val_mean = float(np.mean(val_losses))
         val_r2 = float(np.mean(val_r2_scores))
+        val_tv = float(np.mean(val_tv_scores))
         print(
             f"Epoch {epoch+1}/{EPOCHS} - "
-            f"train KL: {train_mean:.4f} | train R²: {train_r2:.4f} | "
-            f"val KL: {val_mean:.4f} | val R²: {val_r2:.4f}"
+            f"train KL: {train_mean:.4f} | train R²: {train_r2:.4f} | train TV: {train_tv:.4f} | "
+            f"val KL: {val_mean:.4f} | val R²: {val_r2:.4f} | val TV: {val_tv:.4f}"
         )
-        best_val = min(best_val, val_mean)
+        if val_mean < best_softmax_val:
+            best_softmax_val = val_mean
+            best_softmax_state = copy.deepcopy(softmax_model.state_dict())
 
-    return model, best_val, train_set, val_set
+    # Train linear cone probe with L2 loss
+    print("\n=== Training Linear Cone Probe (L2 Loss) ===")
+    torch.manual_seed(SEED)  # Reset for fair comparison
+    train_set, val_set = random_split(dataset, [train_len, val_len])
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+    
+    cone_model = LinearConeProbe(X.shape[1], Y.shape[1]).cuda()
+    cone_optimizer = torch.optim.AdamW(cone_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    best_cone_val = float("inf")
+    best_cone_state = copy.deepcopy(cone_model.state_dict())
+    for epoch in range(EPOCHS):
+        cone_model.train()
+        train_losses = []
+        train_r2_scores = []
+        train_tv_scores = []
+        for batch_x, batch_y in train_loader:
+            batch_x = batch_x.cuda()
+            batch_y = batch_y.cuda()
+            cone_optimizer.zero_grad()
+            probs = cone_model(batch_x)
+            loss = l2_loss(probs, batch_y)
+            loss.backward()
+            cone_optimizer.step()
+            train_losses.append(loss.item())
+            train_r2_scores.append(r2_score(probs.detach(), batch_y).item())
+            train_tv_scores.append(tv_distance(probs.detach(), batch_y).item())
+
+        cone_model.eval()
+        with torch.no_grad():
+            val_losses = []
+            val_r2_scores = []
+            val_tv_scores = []
+            for batch_x, batch_y in val_loader:
+                batch_x = batch_x.cuda()
+                batch_y = batch_y.cuda()
+                probs = cone_model(batch_x)
+                val_losses.append(l2_loss(probs, batch_y).item())
+                val_r2_scores.append(r2_score(probs, batch_y).item())
+                val_tv_scores.append(tv_distance(probs, batch_y).item())
+        train_mean = float(np.mean(train_losses))
+        train_r2 = float(np.mean(train_r2_scores))
+        train_tv = float(np.mean(train_tv_scores))
+        val_mean = float(np.mean(val_losses))
+        val_r2 = float(np.mean(val_r2_scores))
+        val_tv = float(np.mean(val_tv_scores))
+        print(
+            f"Epoch {epoch+1}/{EPOCHS} - "
+            f"train L2: {train_mean:.4f} | train R²: {train_r2:.4f} | train TV: {train_tv:.4f} | "
+            f"val L2: {val_mean:.4f} | val R²: {val_r2:.4f} | val TV: {val_tv:.4f}"
+        )
+        if val_mean < best_cone_val:
+            best_cone_val = val_mean
+            best_cone_state = copy.deepcopy(cone_model.state_dict())
+
+    print(f"\n=== Final Results ===")
+    print(f"Softmax Probe - Best val KL: {best_softmax_val:.4f}")
+    print(f"Linear Cone Probe - Best val L2: {best_cone_val:.4f}")
+
+    return (
+        softmax_model,
+        cone_model,
+        best_softmax_val,
+        best_cone_val,
+        train_set,
+        val_set,
+        best_softmax_state,
+        best_cone_state,
+    )
 
 
 def format_top(dist: np.ndarray, tag_names: List[str], k: int = 5) -> str:
@@ -214,13 +326,14 @@ def format_top(dist: np.ndarray, tag_names: List[str], k: int = 5) -> str:
 
 
 def render_examples(
-    model: DistillationProbe,
+    model: nn.Module,
     loader: DataLoader,
     subset_indices: List[int],
     infos: List[dict],
     tag_names: List[str],
     html_path: Path,
     title: str,
+    is_log_space: bool = True,
 ):
     if not subset_indices:
         print(f"No {title} samples to render.")
@@ -230,7 +343,11 @@ def render_examples(
     truths = []
     with torch.no_grad():
         for batch_x, batch_y in loader:
-            probs = model(batch_x.cuda()).exp().cpu().numpy()
+            out = model(batch_x.cuda())
+            if is_log_space:
+                probs = out.exp().cpu().numpy()
+            else:
+                probs = out.cpu().numpy()
             preds.append(probs)
             truths.append(batch_y.numpy())
     preds = np.concatenate(preds, axis=0)
@@ -294,41 +411,125 @@ th {{ background: #f0f0f0; }}
     print(f"Wrote {title} sample HTML to {html_path}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Distill probe from resampled POS distributions")
+    parser.add_argument("--input", type=Path, default=Path(INPUT_PATH))
+    parser.add_argument("--cache", type=Path, default=CACHE_PATH)
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--recompute-cache", action="store_true")
+    return parser.parse_args()
+
+
 def main():
-    tag_names, records = load_metadata_and_records(Path(INPUT_PATH))
+    args = parse_args()
+    input_path = args.input
+    cache_path = args.cache
+
+    tag_names, records = load_metadata_and_records(input_path)
     samples, infos = collect_samples(records, tag_names)
     if not samples:
         raise RuntimeError("No valid samples after filtering.")
     print(f"Collected {len(samples)} samples with >= {MIN_COMPLETIONS} completions.")
 
-    X, Y = encode_hidden_states(samples)
-    model, best_val, train_subset, val_subset = train_probe(X, Y)
+    use_cache = not args.no_cache
+    cache_valid = False
+    if use_cache and cache_path.exists() and not args.recompute_cache:
+        cache = np.load(cache_path, allow_pickle=True)
+        cached_layers = cache.get("layers")
+        if cached_layers is not None and list(cached_layers) == LAYERS:
+            X = cache["X"]
+            Y = cache["Y"]
+            cache_valid = True
+            print(f"Loaded cached activations from {cache_path}")
+        else:
+            print("Cache layer configuration mismatch; recomputing activations.")
+    if not cache_valid:
+        X, Y = encode_hidden_states(samples)
+        if use_cache:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(cache_path, X=X, Y=Y, layers=np.array(LAYERS))
+            print(f"Cached activations to {cache_path}")
+    
+    (
+        softmax_model,
+        cone_model,
+        best_softmax_val,
+        best_cone_val,
+        train_subset,
+        val_subset,
+        best_softmax_state,
+        best_cone_state,
+    ) = train_probe(X, Y)
 
     train_loader_vis = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=False)
     val_loader_vis = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False)
 
+    # Render softmax probe examples
     render_examples(
-        model,
+        softmax_model,
         train_loader_vis,
         train_subset.indices,
         infos,
         tag_names,
-        HTML_OUTPUT.with_name("distilled_probe_old_train_examples.html"),
-        "training",
+        HTML_OUTPUT.with_name("distilled_probe_train_examples.html"),
+        "Softmax Probe - training",
+        is_log_space=True,
     )
     render_examples(
-        model,
+        softmax_model,
         val_loader_vis,
         val_subset.indices,
         infos,
         tag_names,
         HTML_OUTPUT,
-        "validation",
+        "Softmax Probe - validation",
+        is_log_space=True,
     )
+
+    # Render linear cone probe examples
+    render_examples(
+        cone_model,
+        train_loader_vis,
+        train_subset.indices,
+        infos,
+        tag_names,
+        LINEAR_CONE_HTML_OUTPUT.with_name("linear_cone_probe_train_examples.html"),
+        "Linear Cone Probe - training",
+        is_log_space=False,
+    )
+    render_examples(
+        cone_model,
+        val_loader_vis,
+        val_subset.indices,
+        infos,
+        tag_names,
+        LINEAR_CONE_HTML_OUTPUT,
+        "Linear Cone Probe - validation",
+        is_log_space=False,
+    )
+
+    # Save both models (best or last)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": model.state_dict(), "tag_names": tag_names}, OUTPUT_PATH)
+    mode = SAVE_EPOCH.lower()
+    if mode == "best":
+        softmax_state = best_softmax_state
+        cone_state = best_cone_state
+    elif mode == "last":
+        softmax_state = softmax_model.state_dict()
+        cone_state = cone_model.state_dict()
+    else:
+        raise ValueError("SAVE_EPOCH must be 'best' or 'last'")
+
+    torch.save({"state_dict": softmax_state, "tag_names": tag_names}, OUTPUT_PATH)
+    torch.save({"state_dict": cone_state, "tag_names": tag_names}, LINEAR_CONE_OUTPUT_PATH)
     TAG_NAMES_PATH.write_text(json.dumps(tag_names), encoding="utf-8")
-    print(f"Saved distilled probe to {OUTPUT_PATH} (best val KL={best_val:.4f}).")
+
+    print(
+        f"\nSaved softmax probe to {OUTPUT_PATH} (best val KL={best_softmax_val:.4f}, mode={mode})."
+    )
+    print(
+        f"Saved linear cone probe to {LINEAR_CONE_OUTPUT_PATH} (best val L2={best_cone_val:.4f}, mode={mode})."
+    )
 
 
 if __name__ == "__main__":

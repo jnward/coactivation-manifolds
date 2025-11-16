@@ -6,8 +6,8 @@ import spacy
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-INPUT_PATH = "uncertain_train_spacy_resamples.jsonl"
-OUTPUT_PATH = "spacy_train_output_with_spacy_pos.jsonl"
+INPUT_PATH = "all_train_resamples.jsonl"
+OUTPUT_PATH = "all_train_resamples_with_spacy_pos.jsonl"
 SPACY_MODEL = "en_core_web_trf"
 TOKENIZER_NAME = "google/gemma-2-2b"
 BATCH_SIZE = 16
