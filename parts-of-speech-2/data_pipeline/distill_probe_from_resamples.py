@@ -28,7 +28,7 @@ LINEAR_CONE_HTML_OUTPUT = Path("models/linear_cone_probe_val_examples.html")
 CACHE_PATH = Path("activation_cache/distill_cache_train.npz")
 VAL_CACHE_PATH = Path("activation_cache/distill_cache_val.npz")
 FORCE_REGEN_CACHE = False
-TRAIN_RATIO = 0.9
+TRAIN_RATIO = 1.0
 BATCH_SIZE = 64
 EPOCHS = 100
 LR = 1e-3
@@ -39,6 +39,7 @@ HTML_SAMPLE_SIZE = 64
 SAVE_EPOCH = "last"  # "best" or "last"
 NUM_TRAIN_RESAMPLES = None # completions to use per train example (None for all)
 NUM_TRAIN_EXAMPLES = None # limit number of train examples (None for all)
+FILTER_SINGLE_POS = True
 
 
 @dataclass
@@ -91,15 +92,21 @@ def collect_samples(records: List[dict], tag_names: List[str], max_completions: 
     tag_to_idx = build_tag_map(tag_names)
     samples: List[Sample] = []
     infos: List[dict] = []
-    skipped = 0
+    skipped_unknown = 0
+    skipped_single_pos = 0
     for rec in records:
         candidate = rec.get("candidate", {})
         completions = rec.get("completions", [])
         # Skip records containing tags outside tag_names
         all_pos = [c.get("spacy_pos") for c in completions if c.get("spacy_pos") is not None]
         if any(pos not in tag_to_idx for pos in all_pos):
-            skipped += 1
+            skipped_unknown += 1
             continue
+        if FILTER_SINGLE_POS:
+            uniq = {pos for pos in all_pos if pos in tag_to_idx}
+            if len(uniq) <= 1:
+                skipped_single_pos += 1
+                continue
         dist = build_distribution(completions, tag_to_idx, max_items=max_completions)
         if dist is None:
             continue
@@ -115,7 +122,7 @@ def collect_samples(records: List[dict], tag_names: List[str], max_completions: 
                 "dataset_idx": candidate.get("dataset_idx", -1),
             }
         )
-    return samples, infos, skipped
+    return samples, infos, skipped_unknown, skipped_single_pos
 
 
 def encode_hidden_states(samples: List[Sample]) -> Tuple[np.ndarray, np.ndarray]:
@@ -321,14 +328,18 @@ def sample_subset(X: np.ndarray, Y: np.ndarray, max_examples: int | None):
 
 def load_or_encode_all():
     tag_names, train_records, train_pos = load_metadata_and_records(Path(INPUT_PATH))
+    train_indices = None
+    val_indices = None
     if TRAIN_RATIO < 1.0:
         # Use internal split of the train set; ignore VAL_INPUT_PATH
         if tag_names is None:
             tag_names = sorted(set(train_pos))
             print(f"No tag_names in train metadata; inferred from train records: {tag_names}")
-        train_samples, _, skipped_train = collect_samples(train_records, tag_names, max_completions=NUM_TRAIN_RESAMPLES)
-        if skipped_train:
-            print(f"Skipped {skipped_train} train records due to unknown tags.")
+        train_samples, train_infos, skipped_unknown_train, skipped_single_train = collect_samples(train_records, tag_names, max_completions=NUM_TRAIN_RESAMPLES)
+        if skipped_unknown_train:
+            print(f"Skipped {skipped_unknown_train} train records due to unknown tags.")
+        if skipped_single_train:
+            print(f"Skipped {skipped_single_train} train records due to single POS.")
         print(f"Collected {len(train_samples)} train samples (internal split).")
 
         X, Y = cache_or_encode(train_samples, CACHE_PATH, expected_classes=len(tag_names))
@@ -345,6 +356,8 @@ def load_or_encode_all():
         train_Y = train_subset.dataset.tensors[1][train_subset.indices].numpy()
         val_internal_X = val_subset.dataset.tensors[0][val_subset.indices].numpy()
         val_internal_Y = val_subset.dataset.tensors[1][val_subset.indices].numpy()
+        train_indices = list(train_subset.indices)
+        val_indices = list(val_subset.indices)
 
         # No external val samples/infos in this mode
         val_X = val_internal_X
@@ -372,12 +385,16 @@ def load_or_encode_all():
         if not tag_names:
             raise ValueError("No common tags between train and val.")
 
-        train_samples, _, skipped_train = collect_samples(train_records, tag_names, max_completions=NUM_TRAIN_RESAMPLES)
-        val_samples, val_infos, skipped_val = collect_samples(val_records, tag_names, max_completions=None)
-        if skipped_train:
-            print(f"Skipped {skipped_train} train records due to unknown tags.")
-        if skipped_val:
-            print(f"Skipped {skipped_val} val records due to unknown tags.")
+        train_samples, train_infos, skipped_unknown_train, skipped_single_train = collect_samples(train_records, tag_names, max_completions=NUM_TRAIN_RESAMPLES)
+        val_samples, val_infos, skipped_unknown_val, skipped_single_val = collect_samples(val_records, tag_names, max_completions=None)
+        if skipped_unknown_train:
+            print(f"Skipped {skipped_unknown_train} train records due to unknown tags.")
+        if skipped_single_train:
+            print(f"Skipped {skipped_single_train} train records due to single POS.")
+        if skipped_unknown_val:
+            print(f"Skipped {skipped_unknown_val} val records due to unknown tags.")
+        if skipped_single_val:
+            print(f"Skipped {skipped_single_val} val records due to single POS.")
         print(f"Collected {len(train_samples)} train samples and {len(val_samples)} val samples after filtering.")
 
         # Encode (with caching)
@@ -400,6 +417,8 @@ def load_or_encode_all():
 
         val_internal_X = val_subset.dataset.tensors[0][val_subset.indices].numpy()
         val_internal_Y = val_subset.dataset.tensors[1][val_subset.indices].numpy()
+        train_indices = list(train_subset.indices)
+        val_indices = list(val_subset.indices)
 
     return (
         tag_names,
@@ -412,6 +431,9 @@ def load_or_encode_all():
         train_samples,
         val_samples,
         val_infos,
+        train_infos,
+        train_indices,
+        val_indices,
     )
 
 
@@ -485,6 +507,9 @@ def main():
         train_samples,
         val_samples,
         val_infos,
+        train_infos,
+        train_indices,
+        val_indices,
     ) = load_or_encode_all()
 
     softmax_model, best_softmax_state, cone_model, val_loss, val_tv, val_r2, train_loss, train_tv, train_r2 = train_probe_with_val(
@@ -502,8 +527,26 @@ def main():
         train_probs = cone_model(torch.from_numpy(train_X).cuda()).cpu().numpy()
         val_probs = cone_model(torch.from_numpy(val_X).cuda()).cpu().numpy()
 
-    make_html_samples(train_samples, train_infos := val_infos, train_probs, LINEAR_CONE_HTML_OUTPUT.with_name("linear_cone_probe_train_examples.html"), "Train")
-    make_html_samples(val_samples, val_infos, val_probs, LINEAR_CONE_HTML_OUTPUT, "Validation")
+    if train_infos:
+        html_train_samples = train_samples
+        html_train_infos = train_infos
+        if train_indices is not None:
+            html_train_samples = [train_samples[i] for i in train_indices]
+            html_train_infos = [train_infos[i] for i in train_indices]
+        make_html_samples(
+            html_train_samples,
+            html_train_infos,
+            train_probs,
+            LINEAR_CONE_HTML_OUTPUT.with_name("linear_cone_probe_train_examples.html"),
+            "Train",
+        )
+    if val_infos:
+        html_val_samples = val_samples
+        html_val_infos = val_infos
+        if val_indices is not None and not val_infos:
+            html_val_samples = [train_samples[i] for i in val_indices]
+            html_val_infos = [train_infos[i] for i in val_indices]
+        make_html_samples(html_val_samples, html_val_infos, val_probs, LINEAR_CONE_HTML_OUTPUT, "Validation")
 
     print(f"Linear Cone Probe - Train L2: {train_loss:.4f}, TV: {train_tv:.4f}, R2: {train_r2:.4f}")
     print(f"Linear Cone Probe - Val L2: {val_loss:.4f}, TV: {val_tv:.4f}, R2: {val_r2:.4f}")
