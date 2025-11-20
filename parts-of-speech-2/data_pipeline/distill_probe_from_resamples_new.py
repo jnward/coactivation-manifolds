@@ -16,26 +16,25 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import jsonlines as jsonlines
 
-INPUT_PATH = "data/merged_shards.jsonl"
-VAL_INPUT_PATH = "../filtered_val_resamples_with_spacy_pos.jsonl"
+DATA_DIR = Path(__file__).parent / "data"
+INPUT_PATH = DATA_DIR / "merged_shards.jsonl"
+VAL_INPUT_PATH = DATA_DIR / "../../filtered_train_resamples_with_spacy_pos.jsonl"
 MODEL_NAME = "google/gemma-2-2b"
 LAYERS = [2, 4, 6, 8]
 OUTPUT_PATH = Path("models/distilled_probe_gemma2b.pt")
 LINEAR_CONE_OUTPUT_PATH = Path("models/linear_cone_probe_gemma2b.pt")
 TAG_NAMES_PATH = Path("models/distilled_probe_tag_names.json")
-HTML_OUTPUT = Path("models/distilled_probe_val_examples.html")
-LINEAR_CONE_HTML_OUTPUT = Path("models/linear_cone_probe_val_examples.html")
-CACHE_PATH = Path("activation_cache/distill_cache_train.npz")
-VAL_CACHE_PATH = Path("activation_cache/distill_cache_val.npz")
+CACHE_BASE = Path("activation_cache/distill_cache_train")
+VAL_CACHE_BASE = Path("activation_cache/distill_cache_val")
 FORCE_REGEN_CACHE = False
 TRAIN_RATIO = 1.0
 BATCH_SIZE = 64
-EPOCHS = 100
+EPOCHS = 25
 LR = 1e-3
+WARMUP_STEPS = 1000
 WEIGHT_DECAY = 1e-2
 MIN_COMPLETIONS = 1
 SEED = 1234
-HTML_SAMPLE_SIZE = 64
 SAVE_EPOCH = "last"  # "best" or "last"
 NUM_TRAIN_RESAMPLES = None # completions to use per train example (None for all)
 NUM_TRAIN_EXAMPLES = None # limit number of train examples (None for all)
@@ -221,6 +220,9 @@ def train_probe_with_val(X: np.ndarray, Y: np.ndarray, val_X: np.ndarray, val_Y:
     # Train linear cone probe (ReLU + normalize)
     cone_model = LinearConeProbe(X.shape[1], Y.shape[1]).cuda()
     cone_optimizer = torch.optim.AdamW(cone_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    total_steps = EPOCHS * len(train_loader)
+    cosine_steps = max(1, total_steps - WARMUP_STEPS)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(cone_optimizer, T_max=cosine_steps, eta_min=0.0)
     best_cone_val = float("inf")
     best_cone_state = None
     last_cone_state = None
@@ -229,7 +231,8 @@ def train_probe_with_val(X: np.ndarray, Y: np.ndarray, val_X: np.ndarray, val_Y:
         train_losses = []
         train_r2_scores = []
         train_tv_scores = []
-        for xb, yb in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [train]")
+        for step_idx, (xb, yb) in enumerate(pbar):
             xb = xb.cuda()
             yb = yb.cuda()
             cone_optimizer.zero_grad()
@@ -237,6 +240,15 @@ def train_probe_with_val(X: np.ndarray, Y: np.ndarray, val_X: np.ndarray, val_Y:
             loss = l2_loss(cone_probs, yb)
             loss.backward()
             cone_optimizer.step()
+            # Warmup then cosine
+            global_step = epoch * len(train_loader) + step_idx
+            if scheduler:
+                if global_step < WARMUP_STEPS:
+                    warmup_lr = LR * float(global_step + 1) / float(max(1, WARMUP_STEPS))
+                    for g in cone_optimizer.param_groups:
+                        g["lr"] = warmup_lr
+                else:
+                    scheduler.step(global_step - WARMUP_STEPS)
             train_losses.append(loss.item())
             train_r2_scores.append(r2_score(cone_probs.detach(), yb).item())
             train_tv_scores.append(tv_distance(cone_probs.detach(), yb).item())
@@ -303,20 +315,41 @@ def train_probe_with_val(X: np.ndarray, Y: np.ndarray, val_X: np.ndarray, val_Y:
     return softmax_model, best_softmax_state, cone_model, val_loss, val_tv, val_r2, train_loss, train_tv, train_r2
 
 
-def cache_or_encode(samples: List[Sample], cache_path: Path, expected_classes: int):
-    if cache_path.exists() and not FORCE_REGEN_CACHE:
-        cache = np.load(cache_path, allow_pickle=True)
-        if list(cache["layers"]) == LAYERS and cache["Y"].shape[1] == expected_classes:
-            print(f"Loaded cached activations from {cache_path}")
-            return cache["X"].astype(np.float32), cache["Y"].astype(np.float32)
+def cache_or_encode(samples: List[Sample], cache_base: Path, expected_classes: int, tag_names: List[str] | None):
+    x_path = cache_base.with_name(cache_base.name + "_X.npy")
+    y_path = cache_base.with_name(cache_base.name + "_Y.npy")
+    meta_path = cache_base.with_name(cache_base.name + "_meta.npz")
+
+    cached_tag_names = None
+    if x_path.exists() and y_path.exists() and meta_path.exists() and not FORCE_REGEN_CACHE:
+        meta = np.load(meta_path, allow_pickle=True)
+        layers_ok = list(meta.get("layers", [])) == LAYERS
+        cached_tag_names = meta.get("tag_names")
+        Y_arr = np.load(y_path)
+        if layers_ok and Y_arr.shape[1] == expected_classes:
+            X_arr = np.load(x_path)
+            print(f"Loaded cached activations from {cache_base} (X/Y files)")
+            return X_arr.astype(np.float32), Y_arr.astype(np.float32), cached_tag_names
         else:
             print("Cache configuration mismatch (layers or class count); recomputing activations.")
 
     X, Y = encode_hidden_states(samples)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(cache_path, X=X, Y=Y, layers=np.array(LAYERS))
-    print(f"Cached activations to {cache_path}")
-    return X, Y
+    cache_base.parent.mkdir(parents=True, exist_ok=True)
+    np.save(x_path, X.astype(np.float16))
+    np.save(y_path, Y.astype(np.float32))
+    np.savez(meta_path, layers=np.array(LAYERS), tag_names=np.array(tag_names) if tag_names else None)
+    print(f"Cached activations to {x_path} and {y_path}")
+    return X.astype(np.float32), Y.astype(np.float32), tag_names
+
+
+def align_distributions(Y: np.ndarray, source_tags: List[str], target_tags: List[str]) -> np.ndarray:
+    """Select and renormalize columns to match target_tags ordering."""
+    src_idx = {t: i for i, t in enumerate(source_tags)}
+    cols = [src_idx[t] for t in target_tags if t in src_idx]
+    aligned = Y[:, cols]
+    row_sums = aligned.sum(axis=1, keepdims=True)
+    row_sums = np.clip(row_sums, 1e-8, None)
+    return aligned / row_sums
 
 
 def sample_subset(X: np.ndarray, Y: np.ndarray, max_examples: int | None):
@@ -327,28 +360,61 @@ def sample_subset(X: np.ndarray, Y: np.ndarray, max_examples: int | None):
 
 
 def load_or_encode_all():
-    tag_names, train_records, train_pos = load_metadata_and_records(Path(INPUT_PATH))
+    # Train data
+    train_tag_names = None
+    train_X = train_Y = None
+    train_samples: List[Sample] = []
+    train_infos: List[dict] = []
     train_indices = None
     val_indices = None
+
+    train_cache_x = CACHE_BASE.with_name(CACHE_BASE.name + "_X.npy")
+    train_cache_y = CACHE_BASE.with_name(CACHE_BASE.name + "_Y.npy")
+    train_cache_meta = CACHE_BASE.with_name(CACHE_BASE.name + "_meta.npz")
+
+    if not FORCE_REGEN_CACHE and train_cache_x.exists() and train_cache_y.exists() and train_cache_meta.exists():
+        meta = np.load(train_cache_meta, allow_pickle=True)
+        cached_tags = meta.get("tag_names")
+        if cached_tags is None:
+            raise ValueError("Train cache is missing tag_names; regenerate cache.")
+        train_tag_names = list(cached_tags)
+        train_X = np.load(train_cache_x).astype(np.float32)
+        train_Y = np.load(train_cache_y).astype(np.float32)
+        print(f"Loaded cached activations from {CACHE_BASE}")
+
+    if train_X is None or train_Y is None:
+        tag_meta, train_records, train_pos = load_metadata_and_records(Path(INPUT_PATH))
+        if train_tag_names is None:
+            train_tag_names = tag_meta or sorted(set(train_pos))
+            if tag_meta is None:
+                print(f"No tag_names in train metadata; inferred from train records: {train_tag_names}")
+        train_samples, train_infos, skipped_unknown_train, skipped_single_train = collect_samples(
+            train_records, train_tag_names, max_completions=NUM_TRAIN_RESAMPLES
+        )
+        if skipped_unknown_train:
+            print(f"Skipped {skipped_unknown_train} train records due to unknown tags.")
+        if skipped_single_train:
+            print(f"Skipped {skipped_single_train} train records due to single POS.")
+        print(f"Collected {len(train_samples)} train samples.")
+        if len(train_samples) == 0:
+            raise ValueError("No train samples found after filtering.")
+        train_X, train_Y, _ = cache_or_encode(train_samples, CACHE_BASE, expected_classes=len(train_tag_names), tag_names=train_tag_names)
+
+    train_X, train_Y = sample_subset(train_X, train_Y, NUM_TRAIN_EXAMPLES)
+
+    # Validation handling
+    val_X = val_Y = None
+    val_samples: List[Sample] = []
+    val_infos: List[dict] = []
+    val_internal_X = val_internal_Y = None
+
     if TRAIN_RATIO < 1.0:
-        # Use internal split of the train set; ignore VAL_INPUT_PATH
-        if tag_names is None:
-            tag_names = sorted(set(train_pos))
-            print(f"No tag_names in train metadata; inferred from train records: {tag_names}")
-        train_samples, train_infos, skipped_unknown_train, skipped_single_train = collect_samples(train_records, tag_names, max_completions=NUM_TRAIN_RESAMPLES)
-        if skipped_unknown_train:
-            print(f"Skipped {skipped_unknown_train} train records due to unknown tags.")
-        if skipped_single_train:
-            print(f"Skipped {skipped_single_train} train records due to single POS.")
-        print(f"Collected {len(train_samples)} train samples (internal split).")
-
-        X, Y = cache_or_encode(train_samples, CACHE_PATH, expected_classes=len(tag_names))
-        X, Y = sample_subset(X, Y, NUM_TRAIN_EXAMPLES)
-
-        train_len = int(len(X) * TRAIN_RATIO)
-        val_len = len(X) - train_len
+        # Internal split
+        full_X, full_Y = train_X, train_Y
+        train_len = int(len(full_X) * TRAIN_RATIO)
+        val_len = len(full_X) - train_len
         train_subset, val_subset = random_split(
-            TensorDataset(torch.from_numpy(X), torch.from_numpy(Y)),
+            TensorDataset(torch.from_numpy(full_X), torch.from_numpy(full_Y)),
             [train_len, val_len],
             generator=torch.Generator().manual_seed(SEED),
         )
@@ -356,72 +422,58 @@ def load_or_encode_all():
         train_Y = train_subset.dataset.tensors[1][train_subset.indices].numpy()
         val_internal_X = val_subset.dataset.tensors[0][val_subset.indices].numpy()
         val_internal_Y = val_subset.dataset.tensors[1][val_subset.indices].numpy()
+        val_X, val_Y = val_internal_X, val_internal_Y
         train_indices = list(train_subset.indices)
         val_indices = list(val_subset.indices)
-
-        # No external val samples/infos in this mode
-        val_X = val_internal_X
-        val_Y = val_internal_Y
-        val_samples = []
-        val_infos = []
     else:
-        val_tag_names, val_records, val_pos = load_metadata_and_records(Path(VAL_INPUT_PATH))
-        if tag_names is None:
-            tag_names = sorted(set(train_pos))
-            print(f"No tag_names in train metadata; inferred from train records: {tag_names}")
+        val_cache_x = VAL_CACHE_BASE.with_name(VAL_CACHE_BASE.name + "_X.npy")
+        val_cache_y = VAL_CACHE_BASE.with_name(VAL_CACHE_BASE.name + "_Y.npy")
+        val_cache_meta = VAL_CACHE_BASE.with_name(VAL_CACHE_BASE.name + "_meta.npz")
+
+        val_tag_names = None
+        if not FORCE_REGEN_CACHE and val_cache_x.exists() and val_cache_y.exists() and val_cache_meta.exists():
+            vmeta = np.load(val_cache_meta, allow_pickle=True)
+            cached_vtags = vmeta.get("tag_names")
+            if cached_vtags is None:
+                raise ValueError("Val cache is missing tag_names; regenerate cache.")
+            val_tag_names = list(cached_vtags)
+            val_X = np.load(val_cache_x).astype(np.float32)
+            val_Y = np.load(val_cache_y).astype(np.float32)
+            print(f"Loaded cached val activations from {VAL_CACHE_BASE}")
+
+        if val_X is None or val_Y is None:
+            val_meta, val_records, val_pos = load_metadata_and_records(Path(VAL_INPUT_PATH))
+            val_tag_names = val_meta or sorted(set(val_pos))
+            val_samples, val_infos, skipped_unknown_val, skipped_single_val = collect_samples(
+                val_records, val_tag_names, max_completions=None
+            )
+            if skipped_unknown_val:
+                print(f"Skipped {skipped_unknown_val} val records due to unknown tags.")
+            if skipped_single_val:
+                print(f"Skipped {skipped_single_val} val records due to single POS.")
+            if len(val_samples) == 0:
+                raise ValueError("No val samples found after filtering.")
+            # Use current train_tag_names for alignment
+            val_X, val_Y, _ = cache_or_encode(val_samples, VAL_CACHE_BASE, expected_classes=len(val_tag_names), tag_names=val_tag_names)
+
+        # Align tag sets
         if val_tag_names is None:
-            val_tag_names = sorted(set(val_pos))
-            print(f"No tag_names in val metadata; inferred from val records: {val_tag_names}")
-
-        # Align tag sets to intersection
-        common_tags = sorted(set(tag_names) & set(val_tag_names))
-        dropped_train = sorted(set(tag_names) - set(common_tags))
-        dropped_val = sorted(set(val_tag_names) - set(common_tags))
-        if dropped_train:
-            print(f"Dropping train-only tags: {dropped_train}")
-        if dropped_val:
-            print(f"Dropping val-only tags: {dropped_val}")
-        tag_names = common_tags
-        if not tag_names:
-            raise ValueError("No common tags between train and val.")
-
-        train_samples, train_infos, skipped_unknown_train, skipped_single_train = collect_samples(train_records, tag_names, max_completions=NUM_TRAIN_RESAMPLES)
-        val_samples, val_infos, skipped_unknown_val, skipped_single_val = collect_samples(val_records, tag_names, max_completions=None)
-        if skipped_unknown_train:
-            print(f"Skipped {skipped_unknown_train} train records due to unknown tags.")
-        if skipped_single_train:
-            print(f"Skipped {skipped_single_train} train records due to single POS.")
-        if skipped_unknown_val:
-            print(f"Skipped {skipped_unknown_val} val records due to unknown tags.")
-        if skipped_single_val:
-            print(f"Skipped {skipped_single_val} val records due to single POS.")
-        print(f"Collected {len(train_samples)} train samples and {len(val_samples)} val samples after filtering.")
-
-        # Encode (with caching)
-        X, Y = cache_or_encode(train_samples, CACHE_PATH, expected_classes=len(tag_names))
-        val_X, val_Y = cache_or_encode(val_samples, VAL_CACHE_PATH, expected_classes=len(tag_names))
-
-        X, Y = sample_subset(X, Y, NUM_TRAIN_EXAMPLES)
-
-        # Split train subset (train/val already provided separately; keep full val)
-        train_len = int(len(X) * TRAIN_RATIO)
-        val_len = len(X) - train_len
-        train_subset, val_subset = random_split(
-            TensorDataset(torch.from_numpy(X), torch.from_numpy(Y)),
-            [train_len, val_len],
-            generator=torch.Generator().manual_seed(SEED),
-        )
-
-        train_X = train_subset.dataset.tensors[0][train_subset.indices].numpy()
-        train_Y = train_subset.dataset.tensors[1][train_subset.indices].numpy()
-
-        val_internal_X = val_subset.dataset.tensors[0][val_subset.indices].numpy()
-        val_internal_Y = val_subset.dataset.tensors[1][val_subset.indices].numpy()
-        train_indices = list(train_subset.indices)
-        val_indices = list(val_subset.indices)
+            val_tag_names = train_tag_names
+        common_tags = sorted(set(train_tag_names) & set(val_tag_names))
+        if not common_tags:
+            raise ValueError("No overlapping tag names between train and val.")
+        train_only = sorted(set(train_tag_names) - set(common_tags))
+        val_only = sorted(set(val_tag_names) - set(common_tags))
+        if train_only:
+            print(f"Dropping train-only tags: {train_only}")
+            train_Y = align_distributions(train_Y, train_tag_names, common_tags)
+        if val_only:
+            print(f"Dropping val-only tags: {val_only}")
+            val_Y = align_distributions(val_Y, val_tag_names, common_tags)
+        train_tag_names = common_tags
 
     return (
-        tag_names,
+        train_tag_names,
         train_X,
         train_Y,
         val_internal_X,
@@ -463,34 +515,6 @@ def save_tag_names(tag_names: List[str], path: Path):
     print(f"Saved tag names to {path}")
 
 
-def make_html_samples(samples: List[Sample], infos: List[dict], probs: np.ndarray, path: Path, split: str):
-    import random as pyrandom
-
-    idx = np.random.default_rng(SEED).choice(len(samples), size=min(HTML_SAMPLE_SIZE, len(samples)), replace=False)
-    rows = []
-    for i in idx:
-        info = infos[i]
-        dist = samples[i].distribution
-        pred = probs[i]
-        rows.append(
-            f"<tr><td>{html.escape(info['sentence'])}</td>"
-            f"<td>{html.escape(info['prefix'])}</td>"
-            f"<td>{html.escape(info['target'])}</td>"
-            f"<td>{dist}</td>"
-            f"<td>{pred}</td></tr>"
-        )
-    content = (
-        "<html><body>"
-        f"<h2>{split} samples</h2>"
-        "<table border='1'><tr><th>Sentence</th><th>Prefix</th><th>Target</th><th>GT</th><th>Pred</th></tr>"
-        + "\n".join(rows)
-        + "</table></body></html>"
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    print(f"Wrote HTML samples to {path}")
-
-
 def main():
     args = parse_args()
     global FORCE_REGEN_CACHE
@@ -520,33 +544,6 @@ def main():
     save_probe(cone_model, LINEAR_CONE_OUTPUT_PATH, train_X.shape[1], len(tag_names))
     save_probe(softmax_model, OUTPUT_PATH, train_X.shape[1], len(tag_names)) if softmax_model else None
     save_tag_names(tag_names, TAG_NAMES_PATH)
-
-    # HTML samples
-    cone_model.eval()
-    with torch.no_grad():
-        train_probs = cone_model(torch.from_numpy(train_X).cuda()).cpu().numpy()
-        val_probs = cone_model(torch.from_numpy(val_X).cuda()).cpu().numpy()
-
-    if train_infos:
-        html_train_samples = train_samples
-        html_train_infos = train_infos
-        if train_indices is not None:
-            html_train_samples = [train_samples[i] for i in train_indices]
-            html_train_infos = [train_infos[i] for i in train_indices]
-        make_html_samples(
-            html_train_samples,
-            html_train_infos,
-            train_probs,
-            LINEAR_CONE_HTML_OUTPUT.with_name("linear_cone_probe_train_examples.html"),
-            "Train",
-        )
-    if val_infos:
-        html_val_samples = val_samples
-        html_val_infos = val_infos
-        if val_indices is not None and not val_infos:
-            html_val_samples = [train_samples[i] for i in val_indices]
-            html_val_infos = [train_infos[i] for i in val_indices]
-        make_html_samples(html_val_samples, html_val_infos, val_probs, LINEAR_CONE_HTML_OUTPUT, "Validation")
 
     print(f"Linear Cone Probe - Train L2: {train_loss:.4f}, TV: {train_tv:.4f}, R2: {train_r2:.4f}")
     print(f"Linear Cone Probe - Val L2: {val_loss:.4f}, TV: {val_tv:.4f}, R2: {val_r2:.4f}")

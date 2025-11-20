@@ -20,7 +20,7 @@ SPLIT = "train"
 # Entropy-based candidate selection
 MAX_CONTEXT_TOKENS = 32
 TOKENS_PER_EXAMPLE = 4  # how many targets to sample (weighted by entropy) per example
-MAX_EXAMPLES = 650000  # optional cap over dataset items per shard
+MAX_EXAMPLES = 400000  # optional cap over dataset items per shard
 
 # Generation configuration
 NUM_SAMPLES = 10
@@ -30,7 +30,7 @@ TEMPERATURE = 1.0
 TOP_P = 0.995
 
 # Output / reproducibility
-OUTPUT_PREFIX = "entropy_resamples_shard"
+OUTPUT_PREFIX = "data/entropy_resamples_shard"
 RNG_SEED = 1234
 DEBUG = False
 

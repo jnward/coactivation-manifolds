@@ -18,7 +18,7 @@ GPU_SHARD_MAP = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run per-shard classification")
-    parser.add_argument("--shard-prefix", default="entropy_resamples_subshard")
+    parser.add_argument("--shard-prefix", default="data/entropy_resamples_subshard")
     parser.add_argument("--mapping-json", default=None, help="JSON dict of gpu->shard list")
     parser.add_argument("--output-suffix", default="_with_spacy_pos.jsonl")
     return parser.parse_args()

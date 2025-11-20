@@ -7,6 +7,8 @@ GPU_IDS = ["0", "1", "2", "3", "5", "6", "7"]  # edit as needed
 
 # Path to the resampling script (relative to this file).
 SCRIPT_PATH = Path(__file__).parent / "resample_entropy_tokens_sharded.py"
+OUTPUT_PREFIX = "data/entropy_resamples_shard"
+OUTPUT_SUFFIX = ".jsonl"
 
 
 def main():

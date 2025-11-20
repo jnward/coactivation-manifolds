@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+from tqdm import tqdm
 
 import jsonlines
 
@@ -8,7 +9,7 @@ import jsonlines
 def parse_args():
     parser = argparse.ArgumentParser(description="Merge (and optionally filter) entropy resample shards")
     parser.add_argument("output", type=Path, help="Output merged JSONL")
-    parser.add_argument("--prefix", default="entropy_resamples_subshard", help="Input shard prefix")
+    parser.add_argument("--prefix", default="data/entropy_resamples_subshard", help="Input shard prefix")
     parser.add_argument("--suffix", default="_with_spacy_pos.jsonl", help="Input shard suffix")
     parser.add_argument("--num-shards", type=int, default=1, help="Number of shards to merge")
     parser.add_argument(
@@ -65,7 +66,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(args.output, "w") as writer:
         writer.write(metadata)
-        for path in shard_paths:
+        for path in tqdm(shard_paths):
             for idx, obj in enumerate(iter_records(path)):
                 if idx == 0 and isinstance(obj, dict) and "metadata" in obj:
                     continue
