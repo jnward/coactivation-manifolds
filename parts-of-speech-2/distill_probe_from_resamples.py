@@ -17,23 +17,27 @@ from tqdm import tqdm
 import jsonlines as jsonlines
 
 INPUT_PATH = "filtered_train_resamples_with_spacy_pos.jsonl"
+VAL_INPUT_PATH = "filtered_val_resamples_with_spacy_pos.jsonl"
 MODEL_NAME = "google/gemma-2-2b"
 LAYERS = [2, 4, 6, 8]
-OUTPUT_PATH = Path("spacy_retagged/distilled_probe_layer2-4-6-8-last.pt")
-LINEAR_CONE_OUTPUT_PATH = Path("spacy_retagged/linear_cone_probe_layer2-4-6-8-last.pt")
+OUTPUT_PATH = Path("spacy_retagged/distilled_probe_gemma2b.pt")
+LINEAR_CONE_OUTPUT_PATH = Path("spacy_retagged/linear_cone_probe_gemma2b.pt")
 TAG_NAMES_PATH = Path("spacy_retagged/distilled_probe_tag_names.json")
 HTML_OUTPUT = Path("spacy_retagged/distilled_probe_val_examples.html")
 LINEAR_CONE_HTML_OUTPUT = Path("spacy_retagged/linear_cone_probe_val_examples.html")
-CACHE_PATH = Path("spacy_retagged/distill_cache.npz")
-TRAIN_RATIO = 0.9
+CACHE_PATH = Path("spacy_retagged/distill_cache_train.npz")
+VAL_CACHE_PATH = Path("spacy_retagged/distill_cache_val.npz")
+TRAIN_RATIO = 1.0
 BATCH_SIZE = 64
 EPOCHS = 100
 LR = 1e-3
 WEIGHT_DECAY = 1e-2
-MIN_COMPLETIONS = 10
+MIN_COMPLETIONS = 1
 SEED = 1234
 HTML_SAMPLE_SIZE = 64
 SAVE_EPOCH = "last"  # "best" or "last"
+NUM_TRAIN_RESAMPLES = 100 # completions to use per train example (None for all)
+NUM_TRAIN_EXAMPLES = int(45374 * 1)  # limit number of train examples (None for all)
 
 
 @dataclass
@@ -61,10 +65,10 @@ def build_tag_map(tag_names: List[str]) -> dict[str, int]:
     return {tag: idx for idx, tag in enumerate(tag_names)}
 
 
-def build_distribution(completions: List[dict], tag_to_idx: dict[str, int]) -> np.ndarray | None:
+def build_distribution(completions: List[dict], tag_to_idx: dict[str, int], max_items: int | None = None) -> np.ndarray | None:
     counts = np.zeros(len(tag_to_idx), dtype=np.float64)
     total = 0
-    for comp in completions:
+    for comp in completions[: max_items or len(completions)]:
         label = comp.get("spacy_pos")
         if not label:
             continue
@@ -79,14 +83,14 @@ def build_distribution(completions: List[dict], tag_to_idx: dict[str, int]) -> n
     return counts
 
 
-def collect_samples(records: List[dict], tag_names: List[str]) -> Tuple[List[Sample], List[dict]]:
+def collect_samples(records: List[dict], tag_names: List[str], max_completions: int | None = None) -> Tuple[List[Sample], List[dict]]:
     tag_to_idx = build_tag_map(tag_names)
     samples: List[Sample] = []
     infos: List[dict] = []
     for rec in records:
         candidate = rec.get("candidate", {})
         completions = rec.get("completions", [])
-        dist = build_distribution(completions, tag_to_idx)
+        dist = build_distribution(completions, tag_to_idx, max_items=max_completions)
         if dist is None:
             continue
         tokens = candidate.get("prefix_token_ids")
@@ -166,19 +170,15 @@ class LinearConeProbe(nn.Module):
         return cone_coords / (cone_coords.sum(dim=-1, keepdim=True) + 1e-8)
 
 
-def train_probe(X: np.ndarray, Y: np.ndarray):
+def train_probe_with_val(X: np.ndarray, Y: np.ndarray, val_X: np.ndarray, val_Y: np.ndarray):
     torch.manual_seed(SEED)
-    dataset = TensorDataset(torch.from_numpy(X), torch.from_numpy(Y))
-    train_len = int(len(dataset) * TRAIN_RATIO)
-    val_len = len(dataset) - train_len
-    train_set, val_set = random_split(dataset, [train_len, val_len])
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+    train_loader = DataLoader(TensorDataset(torch.from_numpy(X), torch.from_numpy(Y)), batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.from_numpy(val_X), torch.from_numpy(val_Y)), batch_size=BATCH_SIZE)
 
-    # Train softmax probe with KL divergence
-    print("\n=== Training Softmax Probe (KL Divergence) ===")
-    softmax_model = DistillationProbe(X.shape[1], Y.shape[1]).cuda()
-    softmax_optimizer = torch.optim.AdamW(softmax_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # Train softmax probe with KL divergence (optional; currently disabled)
+    softmax_model = None
+    best_softmax_val = None
+    best_softmax_state = None
 
     def kl_loss(log_probs, target_probs):
         target_safe = target_probs.clamp(min=1e-8)
@@ -200,60 +200,59 @@ def train_probe(X: np.ndarray, Y: np.ndarray):
     def tv_distance(probs, target_probs):
         return 0.5 * torch.sum(torch.abs(probs - target_probs), dim=-1).mean()
 
-    best_softmax_val = float("inf")
-    best_softmax_state = copy.deepcopy(softmax_model.state_dict())
-    for epoch in range(EPOCHS):
-        softmax_model.train()
-        train_losses = []
-        train_r2_scores = []
-        train_tv_scores = []
-        for batch_x, batch_y in train_loader:
-            batch_x = batch_x.cuda()
-            batch_y = batch_y.cuda()
-            softmax_optimizer.zero_grad()
-            log_probs = softmax_model(batch_x)
-            loss = kl_loss(log_probs, batch_y)
-            loss.backward()
-            softmax_optimizer.step()
-            train_losses.append(loss.item())
-            probs = log_probs.exp().detach()
-            train_r2_scores.append(r2_score(probs, batch_y).item())
-            train_tv_scores.append(tv_distance(probs, batch_y).item())
+    # best_softmax_val = float("inf")
+    # best_softmax_state = copy.deepcopy(softmax_model.state_dict())
+    # for epoch in range(EPOCHS):
+    #     softmax_model.train()
+    #     train_losses = []
+    #     train_r2_scores = []
+    #     train_tv_scores = []
+    #     for batch_x, batch_y in train_loader:
+    #         batch_x = batch_x.cuda()
+    #         batch_y = batch_y.cuda()
+    #         softmax_optimizer.zero_grad()
+    #         log_probs = softmax_model(batch_x)
+    #         loss = kl_loss(log_probs, batch_y)
+    #         loss.backward()
+    #         softmax_optimizer.step()
+    #         train_losses.append(loss.item())
+    #         probs = log_probs.exp().detach()
+    #         train_r2_scores.append(r2_score(probs, batch_y).item())
+    #         train_tv_scores.append(tv_distance(probs, batch_y).item())
 
-        softmax_model.eval()
-        with torch.no_grad():
-            val_losses = []
-            val_r2_scores = []
-            val_tv_scores = []
-            for batch_x, batch_y in val_loader:
-                batch_x = batch_x.cuda()
-                batch_y = batch_y.cuda()
-                log_probs = softmax_model(batch_x)
-                probs = log_probs.exp()
-                val_losses.append(kl_loss(log_probs, batch_y).item())
-                val_r2_scores.append(r2_score(probs, batch_y).item())
-                val_tv_scores.append(tv_distance(probs, batch_y).item())
-        train_mean = float(np.mean(train_losses))
-        train_r2 = float(np.mean(train_r2_scores))
-        train_tv = float(np.mean(train_tv_scores))
-        val_mean = float(np.mean(val_losses))
-        val_r2 = float(np.mean(val_r2_scores))
-        val_tv = float(np.mean(val_tv_scores))
-        print(
-            f"Epoch {epoch+1}/{EPOCHS} - "
-            f"train KL: {train_mean:.4f} | train R²: {train_r2:.4f} | train TV: {train_tv:.4f} | "
-            f"val KL: {val_mean:.4f} | val R²: {val_r2:.4f} | val TV: {val_tv:.4f}"
-        )
-        if val_mean < best_softmax_val:
-            best_softmax_val = val_mean
-            best_softmax_state = copy.deepcopy(softmax_model.state_dict())
+    #     softmax_model.eval()
+    #     with torch.no_grad():
+    #         val_losses = []
+    #         val_r2_scores = []
+    #         val_tv_scores = []
+    #         for batch_x, batch_y in val_loader:
+    #             batch_x = batch_x.cuda()
+    #             batch_y = batch_y.cuda()
+    #             log_probs = softmax_model(batch_x)
+    #             probs = log_probs.exp()
+    #             val_losses.append(kl_loss(log_probs, batch_y).item())
+    #             val_r2_scores.append(r2_score(probs, batch_y).item())
+    #             val_tv_scores.append(tv_distance(probs, batch_y).item())
+    #     train_mean = float(np.mean(train_losses))
+    #     train_r2 = float(np.mean(train_r2_scores))
+    #     train_tv = float(np.mean(train_tv_scores))
+    #     val_mean = float(np.mean(val_losses))
+    #     val_r2 = float(np.mean(val_r2_scores))
+    #     val_tv = float(np.mean(val_tv_scores))
+    #     print(
+    #         f"Epoch {epoch+1}/{EPOCHS} - "
+    #         f"train KL: {train_mean:.4f} | train R²: {train_r2:.4f} | train TV: {train_tv:.4f} | "
+    #         f"val KL: {val_mean:.4f} | val R²: {val_r2:.4f} | val TV: {val_tv:.4f}"
+    #     )
+    #     if val_mean < best_softmax_val:
+    #         best_softmax_val = val_mean
+    #         best_softmax_state = copy.deepcopy(softmax_model.state_dict())
 
     # Train linear cone probe with L2 loss
     print("\n=== Training Linear Cone Probe (L2 Loss) ===")
     torch.manual_seed(SEED)  # Reset for fair comparison
-    train_set, val_set = random_split(dataset, [train_len, val_len])
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+    train_loader = DataLoader(TensorDataset(torch.from_numpy(X), torch.from_numpy(Y)), batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.from_numpy(val_X), torch.from_numpy(val_Y)), batch_size=BATCH_SIZE)
     
     cone_model = LinearConeProbe(X.shape[1], Y.shape[1]).cuda()
     cone_optimizer = torch.optim.AdamW(cone_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -305,7 +304,7 @@ def train_probe(X: np.ndarray, Y: np.ndarray):
             best_cone_state = copy.deepcopy(cone_model.state_dict())
 
     print(f"\n=== Final Results ===")
-    print(f"Softmax Probe - Best val KL: {best_softmax_val:.4f}")
+    # print(f"Softmax Probe - Best val KL: {best_softmax_val:.4f}")
     print(f"Linear Cone Probe - Best val L2: {best_cone_val:.4f}")
 
     return (
@@ -313,8 +312,6 @@ def train_probe(X: np.ndarray, Y: np.ndarray):
         cone_model,
         best_softmax_val,
         best_cone_val,
-        train_set,
-        val_set,
         best_softmax_state,
         best_cone_state,
     )
@@ -335,6 +332,8 @@ def render_examples(
     title: str,
     is_log_space: bool = True,
 ):
+    if model is None:
+        return
     if not subset_indices:
         print(f"No {title} samples to render.")
         return
@@ -426,7 +425,7 @@ def main():
     cache_path = args.cache
 
     tag_names, records = load_metadata_and_records(input_path)
-    samples, infos = collect_samples(records, tag_names)
+    samples, infos = collect_samples(records, tag_names, max_completions=NUM_TRAIN_RESAMPLES)
     if not samples:
         raise RuntimeError("No valid samples after filtering.")
     print(f"Collected {len(samples)} samples with >= {MIN_COMPLETIONS} completions.")
@@ -438,37 +437,65 @@ def main():
         cached_layers = cache.get("layers")
         if cached_layers is not None and list(cached_layers) == LAYERS:
             X = cache["X"]
-            Y = cache["Y"]
             cache_valid = True
             print(f"Loaded cached activations from {cache_path}")
         else:
             print("Cache layer configuration mismatch; recomputing activations.")
     if not cache_valid:
-        X, Y = encode_hidden_states(samples)
+        X, _ = encode_hidden_states(samples)
         if use_cache:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(cache_path, X=X, Y=Y, layers=np.array(LAYERS))
+            np.savez_compressed(cache_path, X=X, layers=np.array(LAYERS))
             print(f"Cached activations to {cache_path}")
-    
+    Y = np.array([s.distribution for s in samples], dtype=np.float32)
+    if NUM_TRAIN_EXAMPLES is not None:
+        X = X[:NUM_TRAIN_EXAMPLES]
+        Y = Y[:NUM_TRAIN_EXAMPLES]
+
+    # Load validation set (no caching, since size is smaller)
+    val_tag_names, val_records = load_metadata_and_records(Path(VAL_INPUT_PATH))
+    if val_tag_names != tag_names:
+        raise ValueError("Tag names for train/val do not match.")
+    val_samples, val_infos = collect_samples(val_records, tag_names, max_completions=None)
+    if not val_samples:
+        raise RuntimeError("No validation samples after filtering.")
+    print(f"Collected {len(val_samples)} validation samples with >= {MIN_COMPLETIONS} completions.")
+
+    val_cache_valid = False
+    if use_cache and VAL_CACHE_PATH.exists() and not args.recompute_cache:
+        val_cache = np.load(VAL_CACHE_PATH, allow_pickle=True)
+        cached_layers = val_cache.get("layers")
+        if cached_layers is not None and list(cached_layers) == LAYERS:
+            val_X = val_cache["X"]
+            val_cache_valid = True
+            print(f"Loaded cached val activations from {VAL_CACHE_PATH}")
+        else:
+            print("Val cache layer mismatch; recomputing activations.")
+    if not val_cache_valid:
+        val_X, _ = encode_hidden_states(val_samples)
+        if use_cache:
+            VAL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(VAL_CACHE_PATH, X=val_X, layers=np.array(LAYERS))
+            print(f"Cached val activations to {VAL_CACHE_PATH}")
+    val_Y = np.array([s.distribution for s in val_samples], dtype=np.float32)
+
     (
         softmax_model,
         cone_model,
         best_softmax_val,
         best_cone_val,
-        train_subset,
-        val_subset,
         best_softmax_state,
         best_cone_state,
-    ) = train_probe(X, Y)
+    ) = train_probe_with_val(X, Y, val_X, val_Y)
 
-    train_loader_vis = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=False)
-    val_loader_vis = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader_vis = DataLoader(TensorDataset(torch.from_numpy(X), torch.from_numpy(Y)), batch_size=BATCH_SIZE, shuffle=False)
+    val_loader_vis = DataLoader(TensorDataset(torch.from_numpy(val_X), torch.from_numpy(val_Y)), batch_size=BATCH_SIZE, shuffle=False)
 
     # Render softmax probe examples
     render_examples(
         softmax_model,
         train_loader_vis,
-        train_subset.indices,
+        list(range(len(samples))),
         infos,
         tag_names,
         HTML_OUTPUT.with_name("distilled_probe_train_examples.html"),
@@ -478,8 +505,8 @@ def main():
     render_examples(
         softmax_model,
         val_loader_vis,
-        val_subset.indices,
-        infos,
+        list(range(len(val_samples))),
+        val_infos,
         tag_names,
         HTML_OUTPUT,
         "Softmax Probe - validation",
@@ -490,7 +517,7 @@ def main():
     render_examples(
         cone_model,
         train_loader_vis,
-        train_subset.indices,
+        list(range(len(samples))),
         infos,
         tag_names,
         LINEAR_CONE_HTML_OUTPUT.with_name("linear_cone_probe_train_examples.html"),
@@ -500,8 +527,8 @@ def main():
     render_examples(
         cone_model,
         val_loader_vis,
-        val_subset.indices,
-        infos,
+        list(range(len(val_samples))),
+        val_infos,
         tag_names,
         LINEAR_CONE_HTML_OUTPUT,
         "Linear Cone Probe - validation",
@@ -515,18 +542,22 @@ def main():
         softmax_state = best_softmax_state
         cone_state = best_cone_state
     elif mode == "last":
-        softmax_state = softmax_model.state_dict()
+        softmax_state = None if softmax_model is None else softmax_model.state_dict()
         cone_state = cone_model.state_dict()
     else:
         raise ValueError("SAVE_EPOCH must be 'best' or 'last'")
 
-    torch.save({"state_dict": softmax_state, "tag_names": tag_names}, OUTPUT_PATH)
+    if softmax_state is not None:
+        torch.save({"state_dict": softmax_state, "tag_names": tag_names}, OUTPUT_PATH)
     torch.save({"state_dict": cone_state, "tag_names": tag_names}, LINEAR_CONE_OUTPUT_PATH)
     TAG_NAMES_PATH.write_text(json.dumps(tag_names), encoding="utf-8")
 
-    print(
-        f"\nSaved softmax probe to {OUTPUT_PATH} (best val KL={best_softmax_val:.4f}, mode={mode})."
-    )
+    if softmax_state is not None:
+        print(
+            f"\nSaved softmax probe to {OUTPUT_PATH} (best val KL={best_softmax_val:.4f}, mode={mode})."
+        )
+    else:
+        print("Softmax probe skipped (not saved).")
     print(
         f"Saved linear cone probe to {LINEAR_CONE_OUTPUT_PATH} (best val L2={best_cone_val:.4f}, mode={mode})."
     )

@@ -8,46 +8,116 @@ import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import torch
-import jsonlines as jsonl
 
-import distill_probe_from_resamples as distill
-from distill_probe_from_resamples import (
-    DistillationProbe,
-    LinearConeProbe,
-    load_metadata_and_records,
-    collect_samples,
-    encode_hidden_states,
-    SEED,
-)
-
-
-# Configuration constants
-JSONL_PATH = Path("data/merged_subshards.jsonl")  # train JSONL
-CACHE_PATH = Path("activation_cache/distill_cache_train.npz")  # train cache
+# Configuration
+CACHE_BASE = Path("activation_cache/distill_cache_val_pca")
+VAL_CACHE_BASE = Path("activation_cache/distill_cache_val_pca")
 PROBE_PATH = Path("models/linear_cone_probe_gemma2b.pt")
-PROBE_CLASS = LinearConeProbe  # use DistillationProbe for softmax model
+TAG_NAMES_PATH = Path("models/distilled_probe_tag_names.json")  # tag order used to train the probe
 PROBE_OUTPUT_IS_LOG = False
-POS_CLASSES = ["ADV", "ADP", "SCONJ"]
+POS_CLASSES = ["ADV", "ADP", "SCONJ"]  # three classes to plot on simplex
 SIMPLEX_FIG = Path("models/simplex.png")
 SCATTER_FIG = Path("models/pred_vs_gt.png")
 PRED_3D_HTML = Path("models/pred_linear_3d.html")
 HEATMAP_FIG = Path("models/probe_direction_cosine.png")
 MIN_NONZERO_CLASSES = 2
 MIN_TOTAL_MASS = 0.5
-LAYERS = [2, 4, 6, 8]
-# Internal split config
+LAYERS = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26]
 TRAIN_RATIO = 1.0  # if <1.0, split cached train into train/val subsets
-SPLIT = "train"  # "train" or "val" subset to visualize when using internal split
-# LAYERS = [0]
+SPLIT = "val"  # "train" or "val" when TRAIN_RATIO < 1
+SEED = 1234
+# Optional POS subset; set to None to use full probe tag set.
+CLASS_SUBSET = None
+PCA_DIM = 1024  # per-layer components in cache
+TRUNCATE_PCA_DIM = None  # set to int < PCA_DIM to slice per-layer dims
 
-distill.LAYERS = LAYERS
+
+
+def load_cache(cache_base: Path):
+    x_path = cache_base.with_name(cache_base.name + "_X.npy")
+    y_path = cache_base.with_name(cache_base.name + "_Y.npy")
+    meta_path = cache_base.with_name(cache_base.name + "_meta.npz")
+    if not (x_path.exists() and y_path.exists() and meta_path.exists()):
+        raise FileNotFoundError(f"Cache files missing for base {cache_base}")
+    meta = np.load(meta_path, allow_pickle=True)
+    tags = meta.get("tag_names")
+    layers = meta.get("layers")
+    if tags is None or layers is None:
+        raise ValueError(f"Cache {cache_base} missing tag_names or layers.")
+    if list(layers) != LAYERS:
+        raise ValueError(f"Layer mismatch in cache {cache_base}; expected {LAYERS}, found {list(layers)}")
+    X = np.load(x_path).astype(np.float32)
+    Y = np.load(y_path).astype(np.float32)
+    return X, Y, list(tags)
+
+
+def internal_split(X: np.ndarray, Y: np.ndarray):
+    if not (0 < TRAIN_RATIO < 1):
+        return X, Y, None
+    train_len = int(len(X) * TRAIN_RATIO)
+    val_len = len(X) - train_len
+    train_subset, val_subset = torch.utils.data.random_split(
+        torch.utils.data.TensorDataset(torch.from_numpy(X), torch.from_numpy(Y)),
+        [train_len, val_len],
+        generator=torch.Generator().manual_seed(SEED),
+    )
+    train_X = train_subset.dataset.tensors[0][train_subset.indices].numpy()
+    train_Y = train_subset.dataset.tensors[1][train_subset.indices].numpy()
+    val_X = val_subset.dataset.tensors[0][val_subset.indices].numpy()
+    val_Y = val_subset.dataset.tensors[1][val_subset.indices].numpy()
+    return train_X if SPLIT == "train" else val_X, train_Y if SPLIT == "train" else val_Y, (train_X, train_Y, val_X, val_Y)
+
+
+def align_distributions(Y: np.ndarray, source_tags: List[str], target_tags: List[str]) -> np.ndarray:
+    idx = {t: i for i, t in enumerate(source_tags)}
+    cols = [idx[t] for t in target_tags if t in idx]
+    aligned = Y[:, cols]
+    row_sums = np.clip(aligned.sum(axis=1, keepdims=True), 1e-8, None)
+    return aligned / row_sums
+
+
+def truncate_features(X: np.ndarray) -> np.ndarray:
+    if TRUNCATE_PCA_DIM is None or TRUNCATE_PCA_DIM >= PCA_DIM:
+        return X
+    if X.shape[1] % len(LAYERS) != 0:
+        raise ValueError("X shape not divisible by number of layers; cannot truncate.")
+    per_layer = X.shape[1] // len(LAYERS)
+    if per_layer <= TRUNCATE_PCA_DIM:
+        return X
+    num_layers = len(LAYERS)
+    return X.reshape(X.shape[0], num_layers, per_layer)[:, :, :TRUNCATE_PCA_DIM].reshape(X.shape[0], num_layers * TRUNCATE_PCA_DIM)
+
+
+def apply_class_subset(X: np.ndarray, Y: np.ndarray, tag_names: List[str], subset: List[str]):
+    missing = [t for t in subset if t not in tag_names]
+    if missing:
+        raise ValueError(f"Subset tags missing from tag_names: {missing}")
+    idx = [tag_names.index(t) for t in subset]
+    Y_sub = Y[:, idx]
+    mask = (Y_sub.sum(axis=1) > 0) & ((Y_sub > 0).sum(axis=1) >= 2)
+    Y_sub = Y_sub[mask]
+    X_sub = X[mask]
+    row_sums = np.clip(Y_sub.sum(axis=1, keepdims=True), 1e-8, None)
+    Y_sub = Y_sub / row_sums
+    dropped = len(Y) - len(Y_sub)
+    return X_sub, Y_sub, subset, dropped
 
 
 def load_probe(path: Path, hidden_dim: int, num_classes: int):
     state = torch.load(path, map_location="cuda" if torch.cuda.is_available() else "cpu")
-    model = PROBE_CLASS(hidden_dim, num_classes)
+    model = LinearConeProbe(hidden_dim, num_classes)
     model.load_state_dict(state["state_dict"] if isinstance(state, dict) else state)
     return model.eval().cuda()
+
+
+class LinearConeProbe(torch.nn.Module):
+    def __init__(self, hidden_dim: int, num_classes: int):
+        super().__init__()
+        self.linear = torch.nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        cone_coords = torch.relu(self.linear(x))
+        return cone_coords / (cone_coords.sum(dim=-1, keepdim=True) + 1e-8)
 
 
 def barycentric_to_xy(p1: float, p2: float, p3: float) -> Tuple[float, float]:
@@ -60,47 +130,36 @@ def barycentric_to_xy(p1: float, p2: float, p3: float) -> Tuple[float, float]:
 
 
 def main():
-    tag_names, records, _ = load_metadata_and_records(JSONL_PATH)
-    if tag_names is None:
-        pos_set = set()
-        for rec in records:
-            for comp in rec.get("completions", []):
-                pos = comp.get("spacy_pos")
-                if pos:
-                    pos_set.add(pos)
-        tag_names = sorted(pos_set)
-        print(f"Inferred tag_names: {tag_names}")
-    pos_indices = [tag_names.index(pos) for pos in POS_CLASSES if pos in tag_names]
-
-    # Load cache or compute
-    cache_valid = False
-    if CACHE_PATH.exists():
-        cache = np.load(CACHE_PATH, allow_pickle=True)
-        cached_layers = cache.get("layers")
-        if cached_layers is not None and list(cached_layers) == LAYERS:
-            X = cache["X"]
-            Y = cache["Y"]
-            cache_valid = True
-    if not cache_valid:
-        samples, _, _ = collect_samples(records, tag_names)
-        X, Y = encode_hidden_states(samples)
-        np.savez_compressed(CACHE_PATH, X=X, Y=Y, layers=np.array(LAYERS))
-
-    # Optional internal split
+    # Load caches
+    X, Y, tag_names = load_cache(CACHE_BASE)
+    X = truncate_features(X)
+    # If you want val cache instead, point CACHE_BASE to it; VAL_CACHE_BASE is unused.
     if TRAIN_RATIO < 1.0:
-        train_len = int(len(X) * TRAIN_RATIO)
-        val_len = len(X) - train_len
-        train_subset, val_subset = torch.utils.data.random_split(
-            torch.utils.data.TensorDataset(torch.from_numpy(X), torch.from_numpy(Y)),
-            [train_len, val_len],
-            generator=torch.Generator().manual_seed(SEED),
-        )
-        if SPLIT == "train":
-            X = train_subset.dataset.tensors[0][train_subset.indices].numpy()
-            Y = train_subset.dataset.tensors[1][train_subset.indices].numpy()
-        else:
-            X = val_subset.dataset.tensors[0][val_subset.indices].numpy()
-            Y = val_subset.dataset.tensors[1][val_subset.indices].numpy()
+        X, Y, _ = internal_split(X, Y)
+        X = truncate_features(X)
+
+    # Load probe tag order
+    if TAG_NAMES_PATH.exists():
+        import json
+        probe_tags = json.load(TAG_NAMES_PATH.open())
+    else:
+        raise ValueError(f"Probe tag list not found at {TAG_NAMES_PATH}")
+    # Align to probe tag order; require all tags to be present
+    missing = [t for t in probe_tags if t not in tag_names]
+    if missing:
+        raise ValueError(f"Cache missing probe tags: {missing}")
+    Y = align_distributions(Y, tag_names, probe_tags)
+    tag_names = probe_tags
+
+    # Optional class subset
+    if CLASS_SUBSET:
+        X, Y, subset_tags, dropped = apply_class_subset(X, Y, tag_names, CLASS_SUBSET)
+        tag_names = subset_tags
+        print(f"Applied class subset {CLASS_SUBSET}; dropped {dropped} rows.")
+
+    pos_indices = [tag_names.index(pos) for pos in POS_CLASSES if pos in tag_names]
+    if len(pos_indices) != 3:
+        raise ValueError(f"POS_CLASSES {POS_CLASSES} not all found in tag_names {tag_names}")
 
     dataset = torch.utils.data.TensorDataset(torch.from_numpy(X), torch.from_numpy(Y))
     loader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=False)
@@ -156,28 +215,28 @@ def main():
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
 
     # Predicted simplex
-    axes[0].triplot(simplex_x, simplex_y, 'k-')
+    axes[0].triplot(simplex_x, simplex_y, "k-")
     axes[0].scatter(xs, ys, c=colors_arr, s=20)
     axes[0].text(-0.05, -0.05, POS_CLASSES[0])
     axes[0].text(1.02, -0.05, POS_CLASSES[1])
     axes[0].text(0.5, math.sqrt(3) / 2 + 0.05, POS_CLASSES[2])
     axes[0].set_title("Probe Predictions")
-    axes[0].axis('off')
+    axes[0].axis("off")
 
     # Ground-truth simplex
     gt_points = [barycentric_to_xy(*color) for color in colors_arr]
     gt_xs, gt_ys = zip(*gt_points)
-    axes[1].triplot(simplex_x, simplex_y, 'k-')
+    axes[1].triplot(simplex_x, simplex_y, "k-")
     axes[1].scatter(gt_xs, gt_ys, c=colors_arr, s=20)
     axes[1].text(-0.05, -0.05, POS_CLASSES[0])
     axes[1].text(1.02, -0.05, POS_CLASSES[1])
     axes[1].text(0.5, math.sqrt(3) / 2 + 0.05, POS_CLASSES[2])
     axes[1].set_title("Ground Truth")
-    axes[1].axis('off')
+    axes[1].axis("off")
 
     plt.tight_layout()
     SIMPLEX_FIG.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(SIMPLEX_FIG, bbox_inches='tight', dpi=200)
+    plt.savefig(SIMPLEX_FIG, bbox_inches="tight", dpi=200)
     print(f"Saved simplex visualization to {SIMPLEX_FIG}")
 
     # Scatter plots
@@ -188,16 +247,16 @@ def main():
     for idx, tag in enumerate(tag_names):
         ax = axes[idx]
         ax.scatter(per_class_gt[tag], per_class_pred[tag], s=5, alpha=0.5)
-        ax.plot([0, 1], [0, 1], 'k--', linewidth=0.5)
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.5)
         ax.set_title(tag, fontsize=8)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
-    for ax in axes[len(tag_names):]:
-        ax.axis('off')
+    for ax in axes[len(tag_names) :]:
+        ax.axis("off")
     fig.suptitle("Predicted vs Ground Truth Probabilities")
     plt.tight_layout()
     SCATTER_FIG.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(SCATTER_FIG, bbox_inches='tight', dpi=200)
+    plt.savefig(SCATTER_FIG, bbox_inches="tight", dpi=200)
     plt.close(fig)
     print(f"Saved scatter plots to {SCATTER_FIG}")
 
@@ -215,7 +274,7 @@ def main():
     bias = probe.linear.bias.detach().cpu().numpy()[pos_indices]
     x0 = -np.linalg.pinv(weight_matrix) @ bias
     origin = basis @ x0
-    axes = basis @ weight_matrix.T
+    axes_vecs = basis @ weight_matrix.T
 
     fig3d = go.Figure()
     fig3d.add_trace(
@@ -228,7 +287,7 @@ def main():
         )
     )
     for i, tag in enumerate(POS_CLASSES):
-        end = origin + axes[:, i]
+        end = origin + axes_vecs[:, i]
         fig3d.add_trace(
             go.Scatter3d(
                 x=[origin[0], end[0]],

@@ -17,14 +17,16 @@ from tqdm import tqdm
 import jsonlines as jsonlines
 
 DATA_DIR = Path(__file__).parent / "data"
-INPUT_PATH = DATA_DIR / "merged_shards.jsonl"
-VAL_INPUT_PATH = DATA_DIR / "../../filtered_train_resamples_with_spacy_pos.jsonl"
+# INPUT_PATH = DATA_DIR / "../merged_subshards.jsonl"
+# VAL_INPUT_PATH = DATA_DIR / "../../filtered_train_resamples_with_spacy_pos.jsonl"
+INPUT_PATH = DATA_DIR / "../../filtered_train_resamples_with_spacy_pos.jsonl"
+VAL_INPUT_PATH = DATA_DIR / "../../filtered_val_resamples_with_spacy_pos.jsonl"
 MODEL_NAME = "google/gemma-2-2b"
 LAYERS = [2, 4, 6, 8]
 OUTPUT_PATH = Path("models/distilled_probe_gemma2b.pt")
 LINEAR_CONE_OUTPUT_PATH = Path("models/linear_cone_probe_gemma2b.pt")
 TAG_NAMES_PATH = Path("models/distilled_probe_tag_names.json")
-CACHE_BASE = Path("activation_cache/distill_cache_train")
+CACHE_BASE = Path("activation_cache/distill_cache_train_small")
 VAL_CACHE_BASE = Path("activation_cache/distill_cache_val")
 FORCE_REGEN_CACHE = False
 TRAIN_RATIO = 1.0
@@ -335,7 +337,7 @@ def cache_or_encode(samples: List[Sample], cache_base: Path, expected_classes: i
 
     X, Y = encode_hidden_states(samples)
     cache_base.parent.mkdir(parents=True, exist_ok=True)
-    np.save(x_path, X.astype(np.float16))
+    np.save(x_path, X.astype(np.float32))
     np.save(y_path, Y.astype(np.float32))
     np.savez(meta_path, layers=np.array(LAYERS), tag_names=np.array(tag_names) if tag_names else None)
     print(f"Cached activations to {x_path} and {y_path}")

@@ -4,5 +4,7 @@ data
 *.pt
 *.venv
 *.npz
+*.npy
 *.jsonl
+*.html
 
