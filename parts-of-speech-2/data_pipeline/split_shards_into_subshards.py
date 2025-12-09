@@ -6,11 +6,11 @@ import jsonlines
 from tqdm import tqdm
 
 # Configuration
-INPUT_PREFIX = "data/entropy_resamples_shard"
+INPUT_PREFIX = "../1000_resamples_shard"
 INPUT_SUFFIX = ".jsonl"
-NUM_INPUT_SHARDS = 7
-NUM_SUBSHARDS = 28  # total output sub-shards
-OUTPUT_PREFIX = "data/entropy_resamples_subshard"  # outputs will be OUTPUT_PREFIX{n}.jsonl
+NUM_INPUT_SHARDS = 6
+NUM_SUBSHARDS = 32  # total output sub-shards
+OUTPUT_PREFIX = "../1000_resamples_subshard"  # outputs will be OUTPUT_PREFIX{n}.jsonl
 
 
 def collect_input_paths(prefix: str, suffix: str, num_shards: int) -> List[Path]:

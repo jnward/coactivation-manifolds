@@ -16,6 +16,7 @@ PROBE_PATH = Path("models/linear_cone_probe_gemma2b.pt")
 TAG_NAMES_PATH = Path("models/distilled_probe_tag_names.json")  # tag order used to train the probe
 PROBE_OUTPUT_IS_LOG = False
 POS_CLASSES = ["ADV", "ADP", "SCONJ"]  # three classes to plot on simplex
+# POS_CLASSES = ["CCONJ", "DET", "PRON"]
 SIMPLEX_FIG = Path("models/simplex.png")
 SCATTER_FIG = Path("models/pred_vs_gt.png")
 PRED_3D_HTML = Path("models/pred_linear_3d.html")
@@ -208,7 +209,11 @@ def main():
         return
 
     xs, ys = zip(*points)
+    # Map gt distributions to CMY for better blend visibility
     colors_arr = np.array(colors)
+    # POS1->C (0,1,1), POS2->M (1,0,1), POS3->Y (1,1,0)
+    cmy_map = np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
+    cmy_colors = np.clip(colors_arr @ cmy_map, 0.0, 1.0)  # shape (n,3)
     simplex_x = [0, 1, 0.5]
     simplex_y = [0, 0, math.sqrt(3) / 2]
 
@@ -216,7 +221,7 @@ def main():
 
     # Predicted simplex
     axes[0].triplot(simplex_x, simplex_y, "k-")
-    axes[0].scatter(xs, ys, c=colors_arr, s=20)
+    axes[0].scatter(xs, ys, c=cmy_colors, s=20)
     axes[0].text(-0.05, -0.05, POS_CLASSES[0])
     axes[0].text(1.02, -0.05, POS_CLASSES[1])
     axes[0].text(0.5, math.sqrt(3) / 2 + 0.05, POS_CLASSES[2])
@@ -227,7 +232,7 @@ def main():
     gt_points = [barycentric_to_xy(*color) for color in colors_arr]
     gt_xs, gt_ys = zip(*gt_points)
     axes[1].triplot(simplex_x, simplex_y, "k-")
-    axes[1].scatter(gt_xs, gt_ys, c=colors_arr, s=20)
+    axes[1].scatter(gt_xs, gt_ys, c=cmy_colors, s=20)
     axes[1].text(-0.05, -0.05, POS_CLASSES[0])
     axes[1].text(1.02, -0.05, POS_CLASSES[1])
     axes[1].text(0.5, math.sqrt(3) / 2 + 0.05, POS_CLASSES[2])
@@ -263,8 +268,8 @@ def main():
     # Plotly 3D scatter projected onto orthonormal basis of probe directions
     raw_arr = np.array(raw_vectors)
     activations_arr = np.array(activations)
-    colors_rgb = (colors_arr * 255).astype(int)
-    colors_hex = [f"rgb({r},{g},{b})" for r, g, b in colors_rgb]
+    colors_rgb = np.clip(cmy_colors, 0.0, 1.0)
+    colors_hex = [f"rgb({int(r*255)},{int(g*255)},{int(b*255)})" for r, g, b in colors_rgb]
 
     weight_matrix = probe.linear.weight.detach().cpu().numpy()[pos_indices]  # (3, hidden_dim)
     U, S, Vh = np.linalg.svd(weight_matrix, full_matrices=False)
@@ -283,7 +288,7 @@ def main():
             y=proj_raw[:, 1],
             z=proj_raw[:, 2],
             mode="markers",
-            marker=dict(size=4, color=colors_hex, opacity=0.7),
+            marker=dict(size=4, color=colors_hex, opacity=1.0),
         )
     )
     for i, tag in enumerate(POS_CLASSES):
@@ -294,17 +299,20 @@ def main():
                 y=[origin[1], end[1]],
                 z=[origin[2], end[2]],
                 mode="lines",
-                line=dict(color="black", width=4),
+                line=dict(color="white", width=4),
                 name=tag,
             )
         )
     fig3d.update_layout(
         title="Raw Probe Outputs (orthonormal projection)",
         scene=dict(
-            xaxis_title=POS_CLASSES[0],
-            yaxis_title=POS_CLASSES[1],
-            zaxis_title=POS_CLASSES[2],
+            xaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="black"),
+            yaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="black"),
+            zaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="black"),
+            bgcolor="black",
         ),
+        paper_bgcolor="black",
+        plot_bgcolor="black",
     )
     fig3d.write_html(PRED_3D_HTML)
     print(f"Saved 3D plot to {PRED_3D_HTML}")
