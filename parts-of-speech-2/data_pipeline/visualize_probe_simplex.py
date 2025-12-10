@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Tuple
 
@@ -214,6 +215,46 @@ def main():
     # POS1->C (0,1,1), POS2->M (1,0,1), POS3->Y (1,1,0)
     cmy_map = np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]])
     cmy_colors = np.clip(colors_arr @ cmy_map, 0.0, 1.0)  # shape (n,3)
+
+    # Downsample for uniform density using triangular grid
+    N_DIVISIONS = 30  # 30² = 900 equal triangular cells
+    MAX_PER_CELL = 10  # Points to keep per cell
+
+    # Convert to arrays for indexing
+    xs = np.array(xs)
+    ys = np.array(ys)
+    activations_arr = np.array(activations)
+    raw_vectors_arr = np.array(raw_vectors)
+
+    # Compute triangular grid cell for each point
+    scaled = colors_arr * N_DIVISIONS
+    cell_keys = [(int(s[0]), int(s[1])) for s in scaled.clip(0, N_DIVISIONS - 1e-6)]
+
+    # Group indices by cell
+    cells = defaultdict(list)
+    for i, key in enumerate(cell_keys):
+        cells[key].append(i)
+
+    # Sample up to MAX_PER_CELL from each cell
+    np.random.seed(42)
+    sampled_indices = []
+    for indices in cells.values():
+        if len(indices) <= MAX_PER_CELL:
+            sampled_indices.extend(indices)
+        else:
+            sampled_indices.extend(np.random.choice(indices, MAX_PER_CELL, replace=False))
+
+    sampled_indices = np.array(sampled_indices)
+    print(f"Downsampled from {len(xs)} to {len(sampled_indices)} points ({len(cells)} cells)")
+
+    # Apply downsampling
+    xs = xs[sampled_indices]
+    ys = ys[sampled_indices]
+    colors_arr = colors_arr[sampled_indices]
+    cmy_colors = cmy_colors[sampled_indices]
+    activations_arr = activations_arr[sampled_indices]
+    raw_vectors_arr = raw_vectors_arr[sampled_indices]
+
     simplex_x = [0, 1, 0.5]
     simplex_y = [0, 0, math.sqrt(3) / 2]
 
@@ -228,7 +269,7 @@ def main():
     axes[0].set_title("Probe Predictions")
     axes[0].axis("off")
 
-    # Ground-truth simplex
+    # Ground-truth simplex (use downsampled colors_arr)
     gt_points = [barycentric_to_xy(*color) for color in colors_arr]
     gt_xs, gt_ys = zip(*gt_points)
     axes[1].triplot(simplex_x, simplex_y, "k-")
@@ -266,10 +307,8 @@ def main():
     print(f"Saved scatter plots to {SCATTER_FIG}")
 
     # Plotly 3D scatter projected onto orthonormal basis of probe directions
-    raw_arr = np.array(raw_vectors)
-    activations_arr = np.array(activations)
-    colors_rgb = np.clip(cmy_colors, 0.0, 1.0)
-    colors_hex = [f"rgb({int(r*255)},{int(g*255)},{int(b*255)})" for r, g, b in colors_rgb]
+    # (activations_arr and raw_vectors_arr already downsampled above)
+    colors_hex = [f"rgb({int(r*255)},{int(g*255)},{int(b*255)})" for r, g, b in cmy_colors]
 
     weight_matrix = probe.linear.weight.detach().cpu().numpy()[pos_indices]  # (3, hidden_dim)
     U, S, Vh = np.linalg.svd(weight_matrix, full_matrices=False)
@@ -299,20 +338,20 @@ def main():
                 y=[origin[1], end[1]],
                 z=[origin[2], end[2]],
                 mode="lines",
-                line=dict(color="white", width=4),
+                line=dict(color="black", width=4),
                 name=tag,
             )
         )
     fig3d.update_layout(
         title="Raw Probe Outputs (orthonormal projection)",
         scene=dict(
-            xaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="black"),
-            yaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="black"),
-            zaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="black"),
-            bgcolor="black",
+            xaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="white"),
+            yaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="white"),
+            zaxis=dict(showgrid=False, showticklabels=False, title=None, zeroline=False, backgroundcolor="white"),
+            bgcolor="white",
         ),
-        paper_bgcolor="black",
-        plot_bgcolor="black",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
     )
     fig3d.write_html(PRED_3D_HTML)
     print(f"Saved 3D plot to {PRED_3D_HTML}")
