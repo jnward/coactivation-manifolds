@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Tuple
 
@@ -116,6 +117,29 @@ def compute_1simplex_positions(
     pred_pos = mass_a_pred[mask] / total_pred[mask]
 
     return gt_pos, pred_pos
+
+
+def downsample_1simplex(gt_pos: np.ndarray, pred_pos: np.ndarray, n_bins: int = 30, max_per_bin: int = 30):
+    """Downsample 1-simplex data for uniform density across GT positions."""
+    # Bin by GT position
+    bin_indices = (gt_pos * n_bins).astype(int).clip(0, n_bins - 1)
+
+    # Group indices by bin
+    bins = defaultdict(list)
+    for i, b in enumerate(bin_indices):
+        bins[b].append(i)
+
+    # Sample up to max_per_bin from each bin
+    np.random.seed(42)
+    sampled_indices = []
+    for indices in bins.values():
+        if len(indices) <= max_per_bin:
+            sampled_indices.extend(indices)
+        else:
+            sampled_indices.extend(np.random.choice(indices, max_per_bin, replace=False))
+
+    sampled_indices = np.array(sampled_indices)
+    return gt_pos[sampled_indices], pred_pos[sampled_indices], len(sampled_indices)
 
 
 def plot_simplex_grid(pairs_data: List[dict], output_path: Path):
@@ -379,15 +403,17 @@ def main():
     pairs_data = []
     for score, tag_a, tag_b, idx_a, idx_b in top_pairs:
         gt_pos, pred_pos = compute_1simplex_positions(Y, pred, idx_a, idx_b)
+        n_before = len(gt_pos)
+        gt_pos, pred_pos, n_after = downsample_1simplex(gt_pos, pred_pos, n_bins=300, max_per_bin=10)
         pairs_data.append({
             "tag_a": tag_a,
             "tag_b": tag_b,
             "jaccard": score,
             "gt_pos": gt_pos,
             "pred_pos": pred_pos,
-            "n_samples": len(gt_pos),
+            "n_samples": n_after,
         })
-        print(f"  {tag_a} vs {tag_b}: {len(gt_pos)} samples after filtering")
+        print(f"  {tag_a} vs {tag_b}: {n_before} -> {n_after} samples")
 
     # 6. Generate all four visualization styles
     print("\nGenerating visualizations...")
